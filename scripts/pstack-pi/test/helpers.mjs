@@ -57,6 +57,13 @@ export function makeSource(t, { harness = true } = {}) {
   return root;
 }
 
+/** Add a synthetic pstack skill to an isolated source copy, never to the checkout. */
+export function writeSkill(root, name, description, body) {
+  const dir = join(root, "pstack", "skills", name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: ${description}\n---\n\n${body}`);
+}
+
 export function runScript(script, args = [], options = {}) {
   return spawnSync(process.execPath, [join(repoRoot, "scripts", "pstack-pi", script), ...args], {
     cwd: options.cwd ?? repoRoot,

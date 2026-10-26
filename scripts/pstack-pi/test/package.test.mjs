@@ -32,9 +32,9 @@ test("generate builds a self-contained Pi package from the real sources", (t) =>
       const bytes = readFileSync(from);
       if (path.endsWith(".md")) {
         assert.equal(
-          stripLinks(readFileSync(to, "utf8")),
-          stripLinks(readFileSync(from, "utf8")),
-          `${to} changed text outside its link targets`,
+          stripGenerated(readFileSync(to, "utf8")),
+          stripGenerated(readFileSync(from, "utf8")),
+          `${to} changed text outside its link targets and its adapter entry`,
         );
       } else {
         assert.deepEqual(readFileSync(to), bytes, `${to} does not match ${from}`);
@@ -97,4 +97,9 @@ function statMode(path) {
 
 function stripLinks(text) {
   return text.replace(/\]\([^)\s]+\)/g, "]()");
+}
+
+/** The adapter entry is the one paragraph a packaged skill gains; prompts.test.mjs covers it. */
+function stripGenerated(text) {
+  return stripLinks(text).replace(/^In Pi, read \[the Pi adapter\]\(\)[^\n]*\n\n/m, "");
 }

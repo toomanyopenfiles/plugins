@@ -13,7 +13,9 @@ try {
     if (result.problems.length > 40) console.error(`... and ${result.problems.length - 40} more problems`);
     process.exit(1);
   }
-  console.log(`ok: ${result.pstackSkills} pstack + ${result.bundled} bundled skills, ${result.files} files, no drift`);
+  console.log(
+    `ok: ${result.pstackSkills} pstack + ${result.bundled} bundled skills, ${result.agents} agents, ${result.files} files, no drift`,
+  );
 } catch (error) {
   if (error instanceof PiPackageError) {
     console.error(reportProblems(error.problems));
