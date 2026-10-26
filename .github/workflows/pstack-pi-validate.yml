@@ -1,0 +1,115 @@
+name: Validate pstack Pi candidate
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_run:
+    workflows:
+      - Validate pstack Pi candidate
+    types:
+      - completed
+
+permissions: {}
+
+jobs:
+  validate:
+    name: pstack Pi candidate validation
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'pi-candidate'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the committed candidate head without credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check the committed Pi package without writing
+        run: node scripts/pstack-pi/check.mjs
+
+      - name: Run the deterministic Pi test entry
+        run: node scripts/pstack-pi/test.mjs
+
+  report:
+    name: pstack Pi candidate report
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_branch == 'pi-candidate' &&
+      github.event.workflow_run.path == '.github/workflows/pstack-pi-validate.yml' &&
+      github.event.workflow_run.repository.full_name == github.repository &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].base.ref == 'main'
+    environment: pstack-pi-write
+    concurrency:
+      group: pstack-pi-report-${{ github.event.workflow_run.pull_requests[0].number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Mint the pstack report App token
+        id: report-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.PSTACK_PI_APP_ID }}
+          private-key: ${{ secrets.PSTACK_PI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Check out the trusted main revision only
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Update the single report comment after the head check
+        env:
+          GH_TOKEN: ${{ steps.report-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          EXPECTED_HEAD: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_BASE: ${{ github.event.workflow_run.pull_requests[0].base.ref }}
+          SOURCE_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_WORKFLOW: ${{ github.event.workflow_run.path }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
+          VALIDATION_RESULT: ${{ github.event.workflow_run.conclusion }}
+        run: >-
+          node scripts/pstack-pi/report.mjs
+          --repo "$GITHUB_REPOSITORY"
+          --pr "$PR_NUMBER"
+          --head "$EXPECTED_HEAD"
+          --outcome "$VALIDATION_RESULT"
+          --run-id "$RUN_ID"
+          --run-attempt "$RUN_ATTEMPT"
+          --run-url "$RUN_URL"
+          --source-event "$SOURCE_EVENT"
+          --source-branch "$SOURCE_BRANCH"
+          --source-base "$SOURCE_BASE"
+          --source-repo "$SOURCE_REPO"
+          --source-workflow "$SOURCE_WORKFLOW"

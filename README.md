@@ -181,6 +181,75 @@ All Pi workflows use the **same dedicated GitHub App**; nothing uses the default
 
 No App installation, Environment, secret, inherited-workflow disable, or real workflow trigger was performed while these workflows were written. The local regression uses isolated temporary Git repositories, synthetic `gh` responses, and a local-only remote; it is not evidence that the automation is enabled or that a real round has run.
 
+## Pi candidate package
+
+pstack's Pi package is generated at `harness/pstack/pi/`. The candidate validation workflow is `.github/workflows/pstack-pi-validate.yml`; this section covers installing the candidate locally and reading its validation report. Nothing in this section is enabled or triggered by the local test entry.
+
+### Install the candidate locally
+
+1. In your Pi user settings (`~/.pi/agent/settings.json`), pin the generated package by absolute path:
+
+   ```json
+   {
+     "packages": ["/absolute/path/to/plugins/harness/pstack/pi"]
+   }
+   ```
+
+   Use the absolute path of your own checkout. `pi install /absolute/path/to/plugins/harness/pstack/pi` writes the same declaration if you prefer the CLI. This repository does not edit user settings or install the package for you.
+
+2. Track the persistent candidate branch with a normal pull:
+
+   ```bash
+   git switch pi-candidate
+   git pull
+   ```
+
+   Do not reset or force-push the branch. Keep `pi-candidate` after merging so the next sync can continue from it.
+
+3. Restart Pi after pulling, then verify in a new session. A package that loads, or a green check, is not by itself evidence that a pstack workflow, subagent, or MCP connection works.
+
+4. After you verify the candidate, merge it into `main` by hand, through the candidate pull request or a local merge. Keep the candidate branch.
+
+This delivery does not publish npm, require a second Pi configuration, add a stable/candidate switcher or a candidate download archive, ask for a manual SHA check, or add an acceptance comment or extra approval step.
+
+### Candidate validation reports
+
+`pstack-pi-validate.yml` has two separate entry paths.
+
+- Candidate pull requests from this repository into `main` whose head branch is `pi-candidate` run only the `validate` job. It checks out the committed candidate head with a `contents: read` token and `persist-credentials: false`, then runs `node scripts/pstack-pi/check.mjs` and `node scripts/pstack-pi/test.mjs`. It does not declare a GitHub Environment, receive an App secret, mint an App token, generate or push to the branch, run a real model or product agent, or upload a candidate artifact; the Git branch is the only candidate delivery path. Pull requests from forks are not candidate reports.
+- After that validation run completes, the `workflow_run`-triggered `report` job runs from the trusted `main` workflow definition. It declares the `pstack-pi-write` Environment before it can read the App private key, checks out `main` rather than the candidate head, and runs only `node scripts/pstack-pi/report.mjs`; it never executes candidate scripts. It consumes only trusted `workflow_run` fields (event, path, head branch, repository, PR number, the source run's immutable head SHA, run id and attempt, and conclusion) and verifies the current pull request through the API. The validation result is the GitHub-controlled `workflow_run.conclusion`, never candidate text used as a command.
+- The report job maintains one comment marked `<!-- pstack-pi-candidate-report -->` with the checked head, the pass/fail result, and a link to the validation run's Actions log. Repeated runs update the same comment. Native workflow jobs provide the formal PR Checks status when the workflow is enabled.
+- The report head is the source run's immutable `head_sha`, not the pull request association's current head. Immediately before writing, the report script reads the pull request's current head again and rechecks that the pull request is still the open `pi-candidate` → `main` candidate in this repository. A run for an older head, a closed or mismatched pull request, or an older run for the same head exits without writing, so an old conclusion cannot be attributed to a newer head and a stale run cannot overwrite a newer report.
+
+One dedicated App, not installed by this delivery:
+
+- Both candidate workflows must use the same App and the same protected write boundary. Its public App ID is repository variable `PSTACK_PI_APP_ID`; its private key is the `PSTACK_PI_APP_PRIVATE_KEY` secret inside the `pstack-pi-write` Environment. The sync workflow's credentialed job must also declare that Environment. Its existing `PSTACK_PI_SYNC_APP_ID` and `PSTACK_PI_SYNC_APP_PRIVATE_KEY` entries, if still present, must refer to this same App ID and private key, not a second App; prefer consolidating both workflows on the shared names above.
+- Install the App only on `toomanyopenfiles/plugins`. Grant Issues: write and Pull requests: write for this report job, plus the contents write permission the sync workflow requires; the report token requests only Issues and Pull requests write, and Metadata: read is implicit.
+- Create the `pstack-pi-write` Environment and set its deployment branch policy to `main` only. Do not allow all protected branches, `pi-candidate`, or pull request merge refs.
+- Store the private key only in that Environment, never at repository or organization level. Do not leave a same-named repository or organization secret that a candidate-modified pull request workflow could read. The YAML `environment:` field alone is not a substitute for the Environment policy; verify the policy manually before enabling the workflow.
+- Keep the fork's default workflow token permissions read-only. A same-repository candidate can rewrite its own pull request workflow file, so the checked-in read-only declaration is not a substitute for the repository setting or the Environment policy.
+- Never commit the private key or any token.
+
+`node scripts/pstack-pi/validate.mjs` statically checks the checked-in workflow for the two entry paths, the `workflow_run` source conditions, read-only validation permissions and checkout, the `pstack-pi-write` Environment, the shared App names, controlled report fields, the trusted `main` checkout, and the shell boundary. It does not contact GitHub.
+
+### Not enabled or verified by this delivery
+
+The workflow file is checked in, but this delivery did not install the App, configure the repository variable or Environment secret, create the `pstack-pi-write` Environment or its `main`-only deployment branch policy, enable or trigger the remote workflow, or verify remote permissions. A local fixture, a workflow static check, or a CI result is not evidence that the remote automation is enabled. Those steps require separate authorization.
+
+The inherited `validate-plugins.yml` workflow still runs `node scripts/generate-pstack-harness-trees.mjs --check` over `harness/pstack/`. The Pi validation workflow never calls that generator, but the inherited workflow will report the Pi tree as drift until it is disabled or replaced in the fork. Disabling it is a separate authorized change; this delivery does not modify the inherited workflow or any upstream project setting.
+
+### Later real verification (not executed)
+
+These follow-ups require separate authorization. None ran for this delivery, and none is an acceptance condition:
+
+- poteto-mode on a small change, background completion, and a parent agent reviewing the diff;
+- how or interrogate as a parallel summarizer;
+- reflect with the full review material and approval boundary;
+- one nested or isolated write task that the original workflow needs;
+- MCP connectivity verification if it becomes necessary.
+
+A package that loads, a schema or fixture passing, or CI being green does not prove full workflow compatibility. Real model, agent, MCP, and remote-trigger verification remains unrun.
+
 ## License
 
 MIT
