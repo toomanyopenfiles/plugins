@@ -1,0 +1,66 @@
+name: Pi candidate sync
+
+# Daily at 08:00 Asia/Shanghai (00:00 UTC), plus manual runs.
+# Delivered as source only: nothing here is enabled until the fork installs the sync
+# GitHub App, stores its credentials, and disables the inherited whole-tree harness check.
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pstack-pi-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Add the upstream repository as a read-only remote
+        run: git remote add upstream https://github.com/cursor/plugins.git
+
+      - name: Mint the sync GitHub App token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PSTACK_PI_SYNC_APP_ID }}
+          private-key: ${{ secrets.PSTACK_PI_SYNC_APP_PRIVATE_KEY }}
+          owner: toomanyopenfiles
+          repositories: plugins
+
+      - name: Let git reuse the App token for the candidate push
+        run: gh auth setup-git --hostname github.com
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+
+      - name: Set the sync commit identity
+        env:
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          git config user.name "${APP_SLUG:-pstack-pi-sync}[bot]"
+          git config user.email "${APP_SLUG:-pstack-pi-sync}[bot]@users.noreply.github.com"
+
+      # The write token reaches this step only; the package build and the static check it
+      # spawns run with the token removed from their environment.
+      - name: Sync the frozen candidate branch
+        run: node scripts/pstack-pi/sync.mjs
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PSTACK_PI_REPOSITORY: toomanyopenfiles/plugins
+          PSTACK_PI_TRIGGER: ${{ github.event_name }}
+          PSTACK_PI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

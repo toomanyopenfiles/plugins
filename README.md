@@ -137,6 +137,39 @@ plugins/
 └── ...
 ```
 
+## Pi candidate sync (fork only)
+
+`toomanyopenfiles/plugins` publishes the pstack-for-Pi package through a persistent candidate branch instead of a release. `.github/workflows/pstack-pi-sync.yml` runs every day at 08:00 Asia/Shanghai (UTC cron `0 0 * * *`) and can also be started by hand. Both triggers behave the same way.
+
+Each round does one of the following:
+
+- **Freeze first.** The workflow looks for any open pull request from `pi-candidate` into `main`, drafts included. If one exists it stops before touching the branch. A manual run does not unfreeze it; only merging or closing that pull request does.
+- **Otherwise it syncs.** It pins one `cursor/plugins` commit for the round, merges `main` and that commit into `pi-candidate` with ordinary merges, rebuilds `harness/pstack/pi/` with `node scripts/pstack-pi/generate.mjs`, verifies it with `node scripts/pstack-pi/check.mjs`, and pushes the branch. It never resets the branch and never force-pushes: if another writer moved the branch between the freeze check and the push, the run stops instead of overwriting it. A round with nothing new pushes nothing and opens no empty pull request.
+- **Merge conflicts stop the round.** The merge is aborted, no conflict state is committed, and nothing is pushed. Resolve it by hand on `pi-candidate`.
+- **Build failures still leave a reviewable signal.** The merged source stays committed, but the package is not updated: nothing half-generated is committed, and the run opens a **draft** pull request stating that the committed package is out of sync with this round's source and is not a new candidate. The failing step, its output, and the workflow log link are in the pull request body.
+
+Review the pull request like any other change: it is a normal branch with normal commits, so push fixes to `pi-candidate` as ordinary commits (the freeze only stops the automation), then merge the pull request by hand. Merging keeps `pi-candidate`, so the next round continues from it.
+
+### Write credentials
+
+Writes use one dedicated GitHub App, never the default `GITHUB_TOKEN` and never a personal token:
+
+- Repository permissions: **Contents: read and write**, **Pull requests: read and write**, **Metadata: read**.
+- Installation scope: only `toomanyopenfiles/plugins` under the fork owner.
+- Repository configuration: variable `PSTACK_PI_SYNC_APP_ID` and secret `PSTACK_PI_SYNC_APP_PRIVATE_KEY`. No credential is committed here. The workflow mints a short-lived token, `actions/checkout` runs with `persist-credentials: false`, and the package build and check steps run with `GH_TOKEN`/`GITHUB_TOKEN` removed from their environment, so candidate content is checked without repository write credentials.
+
+`cursor/plugins` stays a read-only input: the sync target is the fork, and `scripts/pstack-pi/sync.mjs` refuses to run against the upstream repository.
+
+### Before this automation can run
+
+**Not enabled in this round.** Three setup steps are still pending and need their own authorization:
+
+1. Install the App on the fork only and add the variable and secret above; re-check that the pinned `actions/create-github-app-token@v2` major version is still the one you reviewed.
+2. Disable the inherited `.github/workflows/validate-plugins.yml` runs in the fork's Actions settings. It invokes `node scripts/generate-pstack-harness-trees.mjs --check`, which owns the whole `harness/pstack/` tree and reports the Pi tree as drift. Adding the Pi workflows does not disable it, and editing the inherited YAML or the upstream project's settings is not the fix.
+3. Start one round by hand, read the resulting pull request, and only then rely on the schedule.
+
+No App installation, secret, inherited-workflow disable, or real workflow trigger was performed while this workflow was written. The local regression uses isolated temporary Git repositories, synthetic `gh` responses, and a local-only remote; it is not evidence that the automation is enabled or that a real round has run.
+
 ## License
 
 MIT
