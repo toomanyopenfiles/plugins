@@ -1,4 +1,4 @@
-# 任务记录：GitHub Issues
+# Issue tracker: GitHub
 
 本项目的任务和规格存放在 `toomanyopenfiles/plugins` 的 GitHub Issues。
 使用 `gh` CLI。

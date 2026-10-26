@@ -1,6 +1,6 @@
 # 分诊标签
 
-| skill 角色 | GitHub 标签 | 含义 |
+| Label in mattpocock/skills | Label in our tracker | 含义 |
 | --- | --- | --- |
 | needs-triage | needs-triage | 等待维护者评估 |
 | needs-info | needs-info | 等待补充信息 |
