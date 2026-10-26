@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
@@ -7,6 +8,8 @@ import {
   failurePullRequestBody,
   pullRequestBody,
   readConfig,
+  readPlan,
+  readResult,
   validationEnv,
 } from "../sync.mjs";
 import { makeSyncFixture, repoRoot } from "./sync-fixtures.mjs";
@@ -19,7 +22,30 @@ const openPullRequest = (number, { draft = false } = {}) => ({
   state: "OPEN",
 });
 
-function assertNoTokenLeak(root, token) {
+function tempDir(t) {
+  const dir = mkdtempSync(join(tmpdir(), "pstack-pi-plan-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+function writePlan(dir, plan) {
+  writeFileSync(join(dir, "plan.json"), JSON.stringify(plan));
+}
+
+const aPlan = {
+  schema: 1,
+  outcome: "proceed",
+  repository: "toomanyopenfiles/plugins",
+  baseBranch: "main",
+  candidateBranch: "pi-candidate",
+  pinned: "a".repeat(40),
+  baseTip: "b".repeat(40),
+  previousCandidateTip: null,
+  candidateTip: "c".repeat(40),
+  hasNewCommits: true,
+};
+
+function assertNoTokenLeak(root, tokens) {
   const found = [];
   const visit = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -27,14 +53,26 @@ function assertNoTokenLeak(root, token) {
       if (entry.isDirectory()) {
         if (entry.name === "objects") continue;
         visit(path);
-      } else if (readFileSync(path, "utf8").includes(token)) {
-        found.push(path);
+      } else {
+        const text = readFileSync(path, "utf8");
+        for (const token of tokens) if (text.includes(token)) found.push(`${path} contains ${token}`);
       }
     }
   };
   visit(root);
-  assert.deepEqual(found, [], "a write credential leaked into the checkout");
+  assert.deepEqual(found, [], "a write credential leaked into a checkout");
 }
+
+function jobSection(workflow, name) {
+  const start = workflow.indexOf(`\n  ${name}:\n`);
+  assert.ok(start >= 0, `the workflow has no ${name} job`);
+  const rest = workflow.slice(start + 1);
+  const next = rest.slice(1).search(/\n  [a-z-]+:\n/);
+  return next < 0 ? rest : rest.slice(0, next + 1);
+}
+
+const workflow = readFileSync(join(repoRoot, ".github", "workflows", "pstack-pi-sync.yml"), "utf8");
+const syncSource = readFileSync(join(repoRoot, "scripts", "pstack-pi", "sync.mjs"), "utf8");
 
 test("sync configuration defaults to the fork, main, and the persistent candidate branch", () => {
   const config = readConfig({});
@@ -51,7 +89,7 @@ test("sync configuration refuses to write to the read-only upstream repository",
   assert.throws(() => readConfig({ PSTACK_PI_REPOSITORY: "plugins" }), /owner\/name/);
 });
 
-test("the package validation children never see repository write credentials", () => {
+test("no token environment survives into the trusted build and check children", () => {
   const scrubbed = validationEnv({
     PATH: "/bin",
     GH_TOKEN: "token",
@@ -68,12 +106,63 @@ test("only a rejected push counts as a race", () => {
   assert.equal(classifyPushFailure("fatal: unable to access remote"), "error");
 });
 
+test("the plan handed between jobs is rejected unless every field is expected", (t) => {
+  const dir = tempDir(t);
+  const config = readConfig({});
+  writePlan(dir, aPlan);
+  assert.equal(readPlan(dir, config).candidateTip, aPlan.candidateTip);
+
+  for (const [field, value, message] of [
+    ["schema", 2, /unknown schema/],
+    ["repository", "cursor/plugins", /not toomanyopenfiles\/plugins/],
+    ["baseBranch", "release", /different base branch/],
+    ["candidateBranch", "other", /different candidate branch/],
+    ["outcome", "maybe", /unknown outcome/],
+    ["pinned", "not-a-sha", /no pinned upstream commit/],
+    ["candidateTip", null, /without a candidate tip/],
+    ["hasNewCommits", "yes", /hasNewCommits/],
+  ]) {
+    writePlan(dir, { ...aPlan, [field]: value });
+    assert.throws(() => readPlan(dir, config), message, `plan field ${field} was accepted`);
+  }
+});
+
+test("the validated result is rejected unless it belongs to the planned candidate", (t) => {
+  const dir = tempDir(t);
+  const config = readConfig({});
+  const plan = aPlan;
+  const aResult = {
+    schema: 1,
+    outcome: "ok",
+    step: null,
+    exitCode: 0,
+    regenerated: true,
+    tip: "d".repeat(40),
+    candidateTip: plan.candidateTip,
+  };
+  writeFileSync(join(dir, "result.json"), JSON.stringify(aResult));
+  assert.equal(readResult(dir, config, plan).tip, aResult.tip);
+
+  for (const [patch, message] of [
+    [{ candidateTip: "e".repeat(40) }, /different candidate tip/],
+    [{ schema: 9 }, /unknown schema/],
+    [{ outcome: "partial" }, /unknown outcome/],
+    [{ step: "deploy" }, /unknown failed step/],
+    [{ regenerated: "yes" }, /regenerated flag/],
+    [{ regenerated: true, tip: null }, /carries no commit/],
+  ]) {
+    writeFileSync(join(dir, "result.json"), JSON.stringify({ ...aResult, ...patch }));
+    assert.throws(() => readResult(dir, config, plan), message);
+  }
+});
+
 test("the candidate pull request records the pinned round and the freeze", () => {
   const pinned = "a".repeat(40);
   const body = pullRequestBody({ config: readConfig({}), pinned });
   assert.match(body, new RegExp(pinned));
+  assert.match(body, /separate credential-free job/);
   assert.match(body, /scripts\/pstack-pi\/check\.mjs/);
-  assert.match(body, /open \(draft or not\)|while this pull request is open/i);
+  assert.match(body, /while this pull request is open/i);
   assert.match(body, /freeze|frozen/i);
 });
 
@@ -82,20 +171,16 @@ test("a failure draft says the package is out of sync instead of a new candidate
   const body = failurePullRequestBody({
     config: readConfig({}),
     pinned,
-    command: "check",
-    output: "FAIL harness/pstack/pi/LICENSE lost its copyright line",
+    step: "check",
+    exitCode: 1,
     runUrl: "https://github.com/toomanyopenfiles/plugins/actions/runs/9",
   });
   assert.match(body, /NOT a new candidate/);
   assert.match(body, /out of sync/);
   assert.match(body, /scripts\/pstack-pi\/check\.mjs/);
-  assert.match(body, /lost its copyright line/);
   assert.match(body, new RegExp(pinned));
   assert.match(body, /actions\/runs\/9/);
 });
-
-const workflow = readFileSync(join(repoRoot, ".github", "workflows", "pstack-pi-sync.yml"), "utf8");
-const syncSource = readFileSync(join(repoRoot, "scripts", "pstack-pi", "sync.mjs"), "utf8");
 
 test("the workflow runs daily at 08:00 Beijing time and also on demand", () => {
   assert.match(workflow, /cron: "0 0 \* \* \*"/);
@@ -108,72 +193,100 @@ test("the workflow runs daily at 08:00 Beijing time and also on demand", () => {
 });
 
 test("the workflow only ever runs the independent Pi entries", () => {
-  assert.match(workflow, /node scripts\/pstack-pi\/sync\.mjs/);
+  assert.match(workflow, /node scripts\/pstack-pi\/sync\.mjs prepare /);
+  assert.match(workflow, /node scripts\/pstack-pi\/sync\.mjs validate /);
+  assert.match(workflow, /node scripts\/pstack-pi\/sync\.mjs publish /);
   assert.doesNotMatch(workflow, /generate-pstack-harness-trees/);
   assert.doesNotMatch(syncSource, /generate-pstack-harness-trees/);
   assert.doesNotMatch(syncSource, /--force(?!-)/, "the sync must never force a push");
   assert.doesNotMatch(syncSource, /force-with-lease/);
+  assert.doesNotMatch(syncSource, /\["reset"/);
   assert.doesNotMatch(syncSource, /--unfreeze|unfreezeOption/);
 });
 
-test("the workflow keeps the write token out of checkout and candidate code", () => {
-  assert.match(workflow, /persist-credentials: false/);
-  assert.match(workflow, /actions\/create-github-app-token@/);
-  assert.match(workflow, /vars\.PSTACK_PI_SYNC_APP_ID/);
-  assert.match(workflow, /secrets\.PSTACK_PI_SYNC_APP_PRIVATE_KEY/);
-  assert.match(workflow, /gh auth setup-git/);
-  assert.match(workflow, /^permissions:\n  contents: read$/m);
+test("the credentialed publish job is the only one that can reach the App key", () => {
+  assert.match(workflow, /^permissions:\n  contents: read\n  pull-requests: read$/m);
   assert.doesNotMatch(workflow, /^\s+contents: write$/m);
-  assert.doesNotMatch(workflow, /^\s{10}token: /m, "checkout must not receive the App token");
-  assert.doesNotMatch(workflow, /^\s{4}env:$/m, "the token must not sit at job level");
+
+  const prepare = jobSection(workflow, "prepare");
+  const validate = jobSection(workflow, "validate");
+  const publish = jobSection(workflow, "publish");
+  for (const section of [prepare, validate]) {
+    assert.doesNotMatch(section, /create-github-app-token/, "only the publish job may mint the App token");
+    assert.doesNotMatch(section, /secrets\.|vars\.PSTACK_PI_APP/, "only the publish job may read the App key");
+    assert.doesNotMatch(section, /GH_TOKEN/, "only the publish job may hold a write token");
+    assert.doesNotMatch(section, /environment:/, "only the publish job may request the write environment");
+  }
+  assert.match(publish, /environment: pstack-pi-write/);
+  assert.match(publish, /vars\.PSTACK_PI_APP_ID/);
+  assert.match(publish, /secrets\.PSTACK_PI_APP_PRIVATE_KEY/);
+  assert.match(publish, /gh auth setup-git/);
+
   const tokenLines = workflow.split("\n").filter((line) => /GH_TOKEN:/.test(line));
   assert.ok(tokenLines.length > 0);
   for (const line of tokenLines) assert.match(line, /^\s{10}GH_TOKEN: /, `token env must stay step-local: ${line}`);
+  assert.doesNotMatch(workflow, /^\s{10}token: /m, "checkout must not receive the App token");
+  assert.doesNotMatch(workflow, /^\s{4}env:$/m, "the token must not sit at job level");
+  for (const match of workflow.matchAll(/^\s+uses: (actions\/checkout@[^\n]+)$/gm)) {
+    assert.ok(match);
+  }
+  assert.equal((workflow.match(/persist-credentials: false/g) ?? []).length, 3, "every checkout runs without persisted credentials");
 });
 
-test("the sync refuses an origin that is not the fork", (t) => {
-  const fixture = makeSyncFixture(t, { sources: false });
-  fixture.git(fixture.work, ["remote", "set-url", "origin", "https://github.com/cursor/plugins.git"]);
-  const result = fixture.run();
-  assert.notEqual(result.status, 0);
-  assert.match(result.output, /not the sync target/);
-  assert.match(result.output, /cursor\/plugins/);
-  assert.deepEqual(fixture.pullRequestLists(), []);
+test("the workflow never interpolates job data into shell code", () => {
+  assert.doesNotMatch(workflow, /run:.*\$\{\{/, "no expression may be spliced into a run step");
+  assert.doesNotMatch(workflow, /run: \|/, "the workflow must not build shell scripts inline");
 });
 
-test("the sync pushes only the candidate branch and never resets it", () => {
-  assert.match(syncSource, /\["push", "origin", `HEAD:refs\/heads\/\$\{config\.candidateBranch\}`\]/);
-  assert.doesNotMatch(syncSource, /\["reset"/);
-  assert.doesNotMatch(syncSource, /--force/);
-  assert.doesNotMatch(syncSource, /push", "--force/);
+test("both Pi workflows share one dedicated App configuration", () => {
+  assert.doesNotMatch(workflow, /PSTACK_PI_SYNC_APP_/);
+  assert.match(workflow, /vars\.PSTACK_PI_APP_ID/);
+  assert.match(workflow, /secrets\.PSTACK_PI_APP_PRIVATE_KEY/);
 });
 
-test("the normal round merges main and the pinned upstream commit, regenerates, pushes, and opens the PR", (t) => {
-  const fixture = makeSyncFixture(t, { recordValidationEnv: true });
-  const result = fixture.run();
+test("the normal round merges, builds without credentials, publishes, and opens the PR", (t) => {
+  const fixture = makeSyncFixture(t);
+  const prepare = fixture.runPrepare();
+  assert.equal(prepare.status, 0, prepare.output);
+  assert.equal(prepare.outcome, "proceed");
+  assert.equal(fixture.ghCalls().length, 1, "the prepare job only asks whether a candidate PR is open");
+  const validate = fixture.runValidate();
+  assert.equal(fixture.ghCalls().length, 1, "the credential-free build must not call gh at all");
+  const publish = fixture.runPublish();
 
-  assert.equal(result.status, 0, result.output);
-  assert.match(result.output, /pull\/101/);
+  assert.equal(validate.status, 0, validate.output);
+  assert.equal(publish.status, 0, publish.output);
+  assert.match(publish.output, /pull\/101/);
+
+  const plan = fixture.plan();
+  const result = fixture.result();
+  assert.equal(plan.pinned, fixture.shas.upstream);
+  assert.equal(plan.hasNewCommits, true);
+  assert.equal(result.outcome, "ok");
+  assert.equal(result.regenerated, true);
 
   const tip = fixture.tip();
   assert.ok(tip, "the candidate branch was pushed");
   assert.equal(fixture.contains(tip, fixture.shas.main), true, "the fork's main is merged");
   assert.equal(fixture.contains(tip, fixture.shas.upstream), true, "the pinned upstream commit is merged");
+  assert.equal(tip, result.tip);
 
   const guide = fixture.fileAt(tip, "harness/pstack/pi/docs/guide/fork-note.md");
   assert.equal(guide.status, 0, "the fork's main source change is packaged");
   const skill = fixture.fileAt(tip, "harness/pstack/pi/skills/tdd/SKILL.md").stdout;
   assert.match(skill, /Upstream note added by the cursor\/plugins fixture/);
-
   const identity = fixture.git(fixture.origin, ["log", "-1", "--format=%an", tip]).stdout.trim();
   assert.equal(identity, "pstack-pi-sync[bot]");
 
   const lists = fixture.pullRequestLists();
-  assert.equal(lists.length, 3, "the freeze is checked before the round, before the push, and before the pull request");
-  const listArgs = lists[0].args;
-  assert.ok(listArgs.includes("--repo") && listArgs[listArgs.indexOf("--repo") + 1] === "toomanyopenfiles/plugins");
-  assert.equal(listArgs[listArgs.indexOf("--head") + 1], "pi-candidate");
-  assert.equal(listArgs[listArgs.indexOf("--state") + 1], "open");
+  assert.equal(lists.length, 3, "the freeze is checked by the prepare job, again before the push, and before opening the PR");
+  for (const list of lists) {
+    const args = list.args;
+    assert.ok(args.includes("--repo") && args[args.indexOf("--repo") + 1] === "toomanyopenfiles/plugins");
+    assert.equal(args[args.indexOf("--head") + 1], "pi-candidate");
+    assert.equal(args[args.indexOf("--state") + 1], "open");
+    assert.ok(!args.includes("--base"), "a candidate PR freezes the branch regardless of its base");
+  }
 
   const created = fixture.pullRequestsCreated();
   assert.equal(created.length, 1);
@@ -182,22 +295,24 @@ test("the normal round merges main and the pinned upstream commit, regenerates, 
   assert.match(created[0].body, new RegExp(fixture.shas.upstream));
 
   assert.equal(fixture.canaryRan(), false, "the inherited whole-tree generator must never run");
-  assert.equal(fixture.git(fixture.work, ["status", "--porcelain"]).stdout, "", "the checkout is fully committed");
-  assertNoTokenLeak(fixture.work, "fixture-token-value");
-  for (const remote of ["origin", "upstream"]) {
-    const url = fixture.git(fixture.work, ["remote", "get-url", remote]).stdout.trim();
-    assert.ok(url.startsWith(fixture.root), `${remote} is a local only remote`);
+  assert.equal(fixture.candidateScriptRan(), false, "no candidate-carried script may run");
+  assert.equal(fixture.branchHead(fixture.runners.publish), "main", "the publish checkout never switches to candidate content");
+  const publishSkill = readFileSync(join(fixture.runners.publish, "pstack", "skills", "tdd", "SKILL.md"), "utf8");
+  assert.doesNotMatch(publishSkill, /Upstream note added by the cursor\/plugins fixture/);
+  assert.equal(fixture.git(fixture.runners.publish, ["status", "--porcelain"]).stdout.trim(), "");
+  for (const runner of Object.values(fixture.runners)) {
+    assertNoTokenLeak(runner, ["fixture-write-token", "fixture-read-token"]);
+    for (const remote of ["origin"]) {
+      const url = fixture.git(runner, ["remote", "get-url", remote]).stdout.trim();
+      assert.ok(url.startsWith(fixture.root), `${remote} is a local only remote`);
+    }
   }
-
-  const validationEnvRecord = JSON.parse(readFileSync(fixture.validationEnvLog, "utf8"));
-  assert.equal(validationEnvRecord.GH_TOKEN, null);
-  assert.equal(validationEnvRecord.GITHUB_TOKEN, null);
 });
 
 test("the round keeps its pinned upstream commit even when upstream moves during the run", (t) => {
   const fixture = makeSyncFixture(t, { advanceUpstreamOnPrList: true });
-  const result = fixture.run();
-  assert.equal(result.status, 0, result.output);
+  const { publish } = fixture.runRound();
+  assert.equal(publish.status, 0, publish.output);
 
   const advanced = fixture.advancedSha();
   assert.ok(advanced, "the fixture moved upstream mid-run");
@@ -208,86 +323,116 @@ test("the round keeps its pinned upstream commit even when upstream moves during
   assert.equal(fixture.contains(tip, advanced), false, "the round must not follow a moving upstream");
 });
 
-test("an open draft candidate pull request freezes the branch", (t) => {
+test("a candidate-carried generator is never executed", (t) => {
+  const fixture = makeSyncFixture(t, { upstreamChange: "tamper-generator" });
+  const { validate, publish } = fixture.runRound();
+  assert.equal(validate.status, 0, validate.output);
+  assert.equal(publish.status, 0, publish.output);
+  assert.equal(fixture.result().outcome, "ok", "the trusted generator built the package");
+  assert.equal(fixture.candidateScriptRan(), false, "the candidate generator ran");
+  assert.equal(fixture.pullRequestsCreated()[0].draft, false);
+});
+
+test("a candidate-carried checker is never executed", (t) => {
+  const fixture = makeSyncFixture(t, { upstreamChange: "tamper-check" });
+  const { validate, publish } = fixture.runRound();
+  assert.equal(validate.status, 0, validate.output);
+  assert.equal(publish.status, 0, publish.output);
+  assert.equal(fixture.result().outcome, "ok", "the trusted checker verified the package");
+  assert.equal(fixture.candidateScriptRan(), false, "the candidate checker ran");
+});
+
+test("an open draft candidate pull request freezes the branch before any build", (t) => {
   const fixture = makeSyncFixture(t, { sources: false, prLists: [[openPullRequest(7, { draft: true })]] });
-  const result = fixture.run();
-  assert.equal(result.status, 0, result.output);
-  assert.match(result.output, /already open/);
-  assert.match(result.output, /#7/);
-  assert.match(result.output, /draft/);
+  const { prepare, validate, publish } = fixture.runRound();
+  assert.equal(prepare.status, 0, prepare.output);
+  assert.equal(prepare.outcome, "frozen");
+  assert.match(prepare.output, /already open/);
+  assert.match(prepare.output, /#7/);
+  assert.match(prepare.output, /draft/);
+  assert.equal(validate, undefined, "no build runs while the branch is frozen");
+  assert.equal(publish, undefined);
   assert.equal(fixture.tip(), undefined, "the frozen run must not create the candidate branch");
+  assert.equal(existsSync(join(fixture.staging.prepared, "candidate.bundle")), false);
   assert.deepEqual(fixture.pullRequestsCreated(), []);
 });
 
 test("an open ready candidate pull request leaves the existing branch untouched", (t) => {
   const fixture = makeSyncFixture(t, { sources: false, candidate: "present", prLists: [[openPullRequest(12)]] });
-  const result = fixture.run();
-  assert.equal(result.status, 0, result.output);
-  assert.match(result.output, /already open/);
+  const { prepare } = fixture.runRound();
+  assert.equal(prepare.outcome, "frozen");
   assert.equal(fixture.tip(), fixture.shas.candidate);
   assert.deepEqual(fixture.pullRequestsCreated(), []);
 });
 
 test("a manual run does not unfreeze the candidate", (t) => {
   const fixture = makeSyncFixture(t, { sources: false, prLists: [[openPullRequest(9, { draft: true })]] });
-  const scheduled = fixture.run();
-  assert.equal(scheduled.status, 0, scheduled.output);
-  const manual = fixture.run({ PSTACK_PI_TRIGGER: "workflow_dispatch" });
-  assert.equal(manual.status, 0, manual.output);
+  const scheduled = fixture.runPrepare();
+  assert.equal(scheduled.outcome, "frozen");
+  const manual = fixture.runPrepare({ PSTACK_PI_TRIGGER: "workflow_dispatch" });
+  assert.equal(manual.outcome, "frozen");
   assert.match(manual.output, /already open/);
   assert.equal(fixture.tip(), undefined);
   assert.deepEqual(fixture.pullRequestsCreated(), []);
 });
 
-test("the freeze is checked again right before the push", (t) => {
+test("the freeze is checked again in the publish job before the push", (t) => {
   const fixture = makeSyncFixture(t, { prLists: [[], [openPullRequest(21, { draft: true })]] });
-  const result = fixture.run();
-  assert.equal(result.status, 0, result.output);
-  assert.match(result.output, /already open/);
+  const { prepare, publish } = fixture.runRound();
+  assert.equal(prepare.outcome, "proceed");
+  assert.equal(publish.status, 0, publish.output);
+  assert.match(publish.output, /already open/);
   assert.equal(fixture.tip(), undefined, "nothing is pushed after a pull request appears");
   assert.deepEqual(fixture.pullRequestsCreated(), []);
-  assert.equal(fixture.git(fixture.work, ["status", "--porcelain"]).stdout, "");
 });
 
 test("a round with nothing new does not push or open an empty pull request", (t) => {
   const fixture = makeSyncFixture(t, { candidate: "upToDate" });
-  const result = fixture.run();
-  assert.equal(result.status, 0, result.output);
-  assert.match(result.output, /no candidate changes/);
+  const { prepare, validate, publish } = fixture.runRound();
+  assert.equal(prepare.outcome, "proceed");
+  assert.equal(fixture.plan().hasNewCommits, false);
+  assert.equal(validate.status, 0, validate.output);
+  assert.equal(fixture.result().regenerated, false);
+  assert.equal(publish.status, 0, publish.output);
+  assert.match(publish.output, /no candidate changes/);
   assert.equal(fixture.tip(), fixture.shas.candidate);
   assert.deepEqual(fixture.pullRequestsCreated(), []);
-  assert.equal(fixture.git(fixture.work, ["status", "--porcelain"]).stdout, "");
 });
 
-test("a merge conflict stops without committing the conflict or pushing", (t) => {
+test("a merge conflict stops before any build or push", (t) => {
   const fixture = makeSyncFixture(t, { sources: false, candidate: "conflict", upstreamChange: "conflict" });
-  const result = fixture.run();
-  assert.equal(result.status, 1, result.output);
-  assert.match(result.output, /merge conflict/);
-  assert.match(result.output, /nothing was pushed|stopped/);
+  const { prepare, validate, publish } = fixture.runRound();
+  assert.equal(prepare.status, 1, prepare.output);
+  assert.match(prepare.output, /merge conflict/);
+  assert.match(prepare.output, /nothing was pushed/);
+  assert.equal(validate, undefined);
+  assert.equal(publish, undefined);
   assert.equal(fixture.tip(), fixture.shas.candidate, "the candidate branch is untouched");
   assert.deepEqual(fixture.pullRequestsCreated(), []);
-  assert.equal(existsSync(join(fixture.work, ".git", "MERGE_HEAD")), false, "no conflict state is left behind");
-  assert.equal(fixture.git(fixture.work, ["status", "--porcelain"]).stdout, "");
 });
 
 test("a push race stops without a force push", (t) => {
   const fixture = makeSyncFixture(t, { race: true });
-  const result = fixture.run();
-  assert.equal(result.status, 1, result.output);
-  assert.match(result.output, /push race/);
-  assert.match(result.output, /without a force push/);
+  const { publish } = fixture.runRound();
+  assert.equal(publish.status, 1, publish.output);
+  assert.match(publish.output, /push race/);
+  assert.match(publish.output, /without a force push/);
   assert.equal(fixture.tip(), fixture.shas.race, "the competing commit stays on the branch");
   assert.deepEqual(fixture.pullRequestsCreated(), []);
 });
 
 test("a generation failure keeps the merged source and opens a draft that marks the old package", (t) => {
   const fixture = makeSyncFixture(t, { upstreamChange: "missing-source" });
-  const result = fixture.run();
-  assert.equal(result.status, 1, result.output);
+  const { prepare, validate, publish } = fixture.runRound();
+  assert.equal(prepare.outcome, "proceed");
+  assert.equal(validate.status, 0, validate.output);
+  const result = fixture.result();
+  assert.equal(result.outcome, "failed");
+  assert.equal(result.step, "generate");
+  assert.equal(result.regenerated, false);
 
+  assert.equal(publish.status, 1, publish.output);
   const tip = fixture.tip();
-  assert.ok(tip, "the merged source is pushed");
   assert.equal(fixture.contains(tip, fixture.shas.upstream), true);
 
   const previousTree = fixture.git(fixture.origin, ["rev-parse", `${fixture.shas.main}:harness/pstack/pi`]).stdout.trim();
@@ -299,18 +444,18 @@ test("a generation failure keeps the merged source and opens a draft that marks 
   assert.equal(created[0].draft, true);
   assert.match(created[0].body, /NOT a new candidate/);
   assert.match(created[0].body, /out of sync/);
-  assert.match(created[0].body, /generate/);
-  assert.match(created[0].body, new RegExp(fixture.shas.upstream));
-  assert.equal(fixture.git(fixture.work, ["status", "--porcelain"]).stdout, "");
+  assert.match(created[0].body, /generate\.mjs/);
+  assert.match(created[0].body, new RegExp(fixture.runUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
-test("a check failure restores the previous package and labels the draft as out of sync", (t) => {
+test("a check failure keeps the previous package and labels the draft as out of sync", (t) => {
   const fixture = makeSyncFixture(t, { upstreamChange: "license" });
-  const result = fixture.run();
-  assert.equal(result.status, 1, result.output);
+  const { validate, publish } = fixture.runRound();
+  assert.equal(validate.status, 0, validate.output);
+  assert.equal(fixture.result().step, "check");
+  assert.equal(publish.status, 1, publish.output);
 
   const tip = fixture.tip();
-  assert.ok(tip);
   const previousLicense = fixture.fileAt(fixture.shas.main, "harness/pstack/pi/LICENSE").stdout;
   const committedLicense = fixture.fileAt(tip, "harness/pstack/pi/LICENSE").stdout;
   assert.match(committedLicense, /Copyright \(c\)/);
@@ -320,12 +465,88 @@ test("a check failure restores the previous package and labels the draft as out 
   assert.equal(created.length, 1);
   assert.equal(created[0].draft, true);
   assert.match(created[0].body, /NOT a new candidate/);
-  assert.match(created[0].body, /scripts\/pstack-pi\/check\.mjs/);
-  assert.match(created[0].body, /lost its copyright line/);
-  assert.equal(fixture.git(fixture.work, ["status", "--porcelain"]).stdout, "");
+  assert.match(created[0].body, /check\.mjs/);
 });
 
-test("the README documents the freeze, repair, and remaining fork configuration", () => {
+test("publish refuses a validated commit that touches files outside the package", (t) => {
+  const fixture = makeSyncFixture(t);
+  assert.equal(fixture.runPrepare().outcome, "proceed");
+  assert.equal(fixture.runValidate().status, 0);
+  fixture.forgePackage({
+    mutate: (work) => fixture.addPackageFile(work, "scripts/pstack-pi/backdoor.mjs", "console.log('backdoor');\n"),
+  });
+
+  const publish = fixture.runPublish();
+  assert.notEqual(publish.status, 0);
+  assert.match(publish.output, /outside harness\/pstack\/pi/);
+  assert.deepEqual(fixture.pullRequestsCreated(), []);
+});
+
+test("publish refuses a validated package that smuggles a symlink", (t) => {
+  const fixture = makeSyncFixture(t);
+  fixture.runPrepare();
+  fixture.runValidate();
+  fixture.forgePackage({
+    mutate: (work) => fixture.addPackageSymlink(work, "harness/pstack/pi/leak.md", "/etc/passwd"),
+  });
+
+  const publish = fixture.runPublish();
+  assert.notEqual(publish.status, 0);
+  assert.match(publish.output, /file mode 120000/);
+  assert.deepEqual(fixture.pullRequestsCreated(), []);
+});
+
+test("publish refuses a validated package that is more than one commit", (t) => {
+  const fixture = makeSyncFixture(t);
+  fixture.runPrepare();
+  fixture.runValidate();
+  fixture.forgePackage({ commits: 2, mutate: (work) => fixture.addPackageFile(work, "harness/pstack/pi/extra.md", "extra\n") });
+
+  const publish = fixture.runPublish();
+  assert.notEqual(publish.status, 0);
+  assert.match(publish.output, /not a single commit/);
+  assert.deepEqual(fixture.pullRequestsCreated(), []);
+});
+
+test("publish refuses a plan that targets another branch", (t) => {
+  const fixture = makeSyncFixture(t);
+  fixture.runPrepare();
+  fixture.runValidate();
+  const plan = fixture.plan();
+  const staged = fixture.stageForPublish();
+  writeFileSync(join(staged.prepared, "plan.json"), JSON.stringify({ ...plan, candidateBranch: "someone-else" }));
+
+  const publish = fixture.runPublish();
+  assert.notEqual(publish.status, 0);
+  assert.match(publish.output, /different candidate branch/);
+  assert.deepEqual(fixture.pullRequestsCreated(), []);
+});
+
+test("publish refuses a result that belongs to another candidate tip", (t) => {
+  const fixture = makeSyncFixture(t);
+  fixture.runPrepare();
+  fixture.runValidate();
+  const result = fixture.result();
+  const staged = fixture.stageForPublish();
+  writeFileSync(join(staged.validated, "result.json"), JSON.stringify({ ...result, candidateTip: "f".repeat(40) }));
+
+  const publish = fixture.runPublish();
+  assert.notEqual(publish.status, 0);
+  assert.match(publish.output, /different candidate tip/);
+  assert.deepEqual(fixture.pullRequestsCreated(), []);
+});
+
+test("prepare refuses an origin that is not the fork", (t) => {
+  const fixture = makeSyncFixture(t, { sources: false });
+  fixture.git(fixture.runners.prepare, ["remote", "set-url", "origin", "https://github.com/cursor/plugins.git"]);
+  const prepare = fixture.runPrepare();
+  assert.notEqual(prepare.status, 0);
+  assert.match(prepare.output, /not the sync target/);
+  assert.match(prepare.output, /cursor\/plugins/);
+  assert.deepEqual(fixture.pullRequestLists(), []);
+});
+
+test("the README documents the freeze, the trust split, and the remaining fork configuration", () => {
   const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
   const start = readme.indexOf("## Pi candidate sync");
   assert.ok(start > 0, "the README has no Pi candidate sync section");
@@ -337,7 +558,13 @@ test("the README documents the freeze, repair, and remaining fork configuration"
   assert.match(section, /freeze|frozen/i);
   assert.match(section, /force-push|force push/i);
   assert.match(section, /Contents: read and write/i);
-  assert.match(section, /PSTACK_PI_SYNC_APP_ID/);
-  assert.match(section, /validate-plugins\.yml/);
+  assert.match(section, /`PSTACK_PI_APP_ID`/);
+  assert.match(section, /`PSTACK_PI_APP_PRIVATE_KEY`/);
+  assert.match(section, /pstack-pi-write/);
+  assert.match(section, /deployment branch policy/i);
+  assert.match(section, /only.*main/i);
   assert.match(section, /not enabled/i);
+  assert.match(section, /credential-free|without write credentials/i);
+  assert.match(section, /validate-plugins\.yml/);
+  assert.match(section, /same dedicated GitHub App/i);
 });

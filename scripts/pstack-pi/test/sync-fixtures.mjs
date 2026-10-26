@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,7 @@ const SOURCES = [
 ];
 const MINIMAL_SOURCES = ["pstack/skills/tdd"];
 const SCRIPTS = ["lib.mjs", "generate.mjs", "check.mjs", "sync.mjs"];
+const OUTPUT = "harness/pstack/pi";
 
 // The inherited whole-tree generator must never run from the Pi sync path. If it does,
 // it leaves this canary behind in the checkout.
@@ -34,21 +35,20 @@ console.error("the inherited whole-tree harness generator must not run from the 
 process.exit(1);
 `;
 
-const VALIDATION_ENV_WRAPPER = `import { spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+/** A candidate-carried copy of a trusted entry script. Running it must leave a marker and fail. */
+function candidateScript(name) {
+  return `import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
-const here = dirname(fileURLToPath(import.meta.url));
-if (process.env.PSTACK_PI_TEST_ENV_LOG) {
-  writeFileSync(
-    process.env.PSTACK_PI_TEST_ENV_LOG,
-    JSON.stringify({ GH_TOKEN: process.env.GH_TOKEN ?? null, GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? null, PSTACK_PI_GH: process.env.PSTACK_PI_GH ?? null }),
-  );
+const dir = process.env.PSTACK_PI_MARKER_DIR;
+if (dir) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "candidate-${name}-ran.txt"), "called\\n");
 }
-const result = spawnSync(process.execPath, [join(here, "generate-real.mjs"), ...process.argv.slice(2)], { stdio: "inherit" });
-process.exit(result.status ?? 1);
+console.error("the candidate-carried ${name} must not run");
+process.exit(1);
 `;
+}
 
 const FAKE_GH = `#!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -87,9 +87,9 @@ process.stdout.write((typeof entry.result === "string" ? entry.result : JSON.str
 `;
 
 /**
- * Build an isolated fixture: a bare `origin` (the fork), a bare `upstream` that shares the
- * fork's history, and a working clone where `sync.mjs` runs. Every push in these fixtures
- * lands in a temporary local bare repository, never a real remote.
+ * Build an isolated fixture with the same three checkouts the workflow uses: a trusted prepare
+ * runner, a credential-free validate runner, and a credential-holding publish runner. Every push
+ * lands in a temporary local bare repository; `gh` is a local stub; nothing leaves the machine.
  */
 export function makeSyncFixture(t, options = {}) {
   const {
@@ -97,7 +97,6 @@ export function makeSyncFixture(t, options = {}) {
     upstreamChange = "skill",
     candidate = "absent",
     mainAdvanced = true,
-    recordValidationEnv = false,
     race = false,
     prLists = [[]],
     advanceUpstreamOnPrList = false,
@@ -108,8 +107,9 @@ export function makeSyncFixture(t, options = {}) {
   const gitConfig = join(root, "gitconfig");
   writeFileSync(gitConfig, "");
   const env = { ...process.env, GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_NOSYSTEM: "1" };
-  delete env.GH_TOKEN;
-  delete env.GITHUB_TOKEN;
+  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GITHUB_OUTPUT", "PSTACK_PI_REPOSITORY", "PSTACK_PI_RUN_URL", "PSTACK_PI_TRIGGER"]) {
+    delete env[key];
+  }
 
   const git = (cwd, args, allowFailure = false) => {
     const result = spawnSync("git", args, { cwd, encoding: "utf8", env, timeout: 120_000 });
@@ -139,10 +139,6 @@ export function makeSyncFixture(t, options = {}) {
   }
   writeFileSync(join(seed, "scripts", "generate-pstack-harness-trees.mjs"), CANARY);
   writeFileSync(join(seed, "README.md"), "# fixture fork\n");
-  if (recordValidationEnv) {
-    cpSync(join(seed, "scripts", "pstack-pi", "generate.mjs"), join(seed, "scripts", "pstack-pi", "generate-real.mjs"));
-    writeFileSync(join(seed, "scripts", "pstack-pi", "generate.mjs"), VALIDATION_ENV_WRAPPER);
-  }
   if (sources) node(seed, join(seed, "scripts", "pstack-pi", "generate.mjs"), ["--root", seed]);
 
   git(seed, ["init", "-b", "main"]);
@@ -196,9 +192,11 @@ export function makeSyncFixture(t, options = {}) {
     candidateSha = git(candidateWork, ["rev-parse", "HEAD"]).stdout.trim();
   }
 
-  const work = join(root, "work");
-  git(root, ["clone", origin, "work"]);
-  git(work, ["remote", "add", "upstream", upstream]);
+  const prepareRunner = join(root, "prepare-runner");
+  const validateRunner = join(root, "validate-runner");
+  const publishRunner = join(root, "publish-runner");
+  for (const runner of [prepareRunner, validateRunner, publishRunner]) git(root, ["clone", origin, runner]);
+  git(prepareRunner, ["remote", "add", "upstream", upstream]);
 
   let raceSha;
   if (race) {
@@ -211,7 +209,7 @@ export function makeSyncFixture(t, options = {}) {
     git(raceWork, ["add", "-A"]);
     git(raceWork, ["commit", "-m", "race: competing candidate commit"]);
     raceSha = git(raceWork, ["rev-parse", "HEAD"]).stdout.trim();
-    const hook = join(work, ".git", "hooks", "pre-push");
+    const hook = join(publishRunner, ".git", "hooks", "pre-push");
     writeFileSync(
       hook,
       `#!/bin/sh\ngit -C ${JSON.stringify(raceWork)} push origin HEAD:refs/heads/pi-candidate >/dev/null 2>&1\nexit 0\n`,
@@ -219,7 +217,6 @@ export function makeSyncFixture(t, options = {}) {
     chmodSync(hook, 0o755);
   }
 
-  let advancedSha;
   let advanceCommand;
   if (advanceUpstreamOnPrList) {
     const script = join(root, "advance-upstream.sh");
@@ -236,12 +233,55 @@ export function makeSyncFixture(t, options = {}) {
     advanceCommand = `sh ${JSON.stringify(script)}`;
   }
 
-  const fakeGh = join(root, "fake-gh.mjs");
-  writeFileSync(fakeGh, FAKE_GH);
-  chmodSync(fakeGh, 0o755);
+  const bin = join(root, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "gh"), FAKE_GH);
+  chmodSync(join(bin, "gh"), 0o755);
   writeFileSync(join(root, "pr-lists.json"), `${JSON.stringify(prLists)}\n`);
   writeFileSync(join(root, "gh-log.jsonl"), "");
 
+  const staging = {
+    prepared: join(root, "staging", "prepared"),
+    validateInput: join(root, "staging", "validate-input"),
+    validated: join(root, "staging", "validated"),
+    publishPrepared: join(root, "staging", "publish-prepared"),
+    publishValidated: join(root, "staging", "publish-validated"),
+  };
+  const markerDir = join(root, "markers");
+  const runUrl = "https://github.com/toomanyopenfiles/plugins/actions/runs/12345";
+
+  const baseEnv = (extra = {}) => ({
+    ...env,
+    PATH: `${bin}:${env.PATH}`,
+    FAKE_GH_LOG: join(root, "gh-log.jsonl"),
+    FAKE_GH_STATE: join(root, "gh-state.json"),
+    FAKE_GH_PR_LISTS: join(root, "pr-lists.json"),
+    ...(advanceCommand ? { FAKE_GH_ON_LIST: advanceCommand } : {}),
+    PSTACK_PI_RUN_URL: runUrl,
+    PSTACK_PI_TRIGGER: "schedule",
+    ...extra,
+  });
+
+  const spawnStage = (runner, args, stageEnv, outputFile) => {
+    rmSync(outputFile, { force: true });
+    const result = spawnSync(process.execPath, [join(runner, "scripts", "pstack-pi", "sync.mjs"), ...args], {
+      cwd: runner,
+      encoding: "utf8",
+      env: stageEnv,
+      timeout: 600_000,
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    if (output.includes("fixture-write-token") || output.includes("fixture-read-token")) {
+      throw new Error(`a fixture token reached the stage output:\n${output}`);
+    }
+    return { status: result.status, output, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+  };
+
+  /**
+   * Run one stage as a separate checkout with only the staged files handed across, the way the
+   * workflow passes artifacts between jobs. The validate and publish runners never see the
+   * candidate working tree of another stage.
+   */
   const fixture = {
     root,
     env,
@@ -249,41 +289,74 @@ export function makeSyncFixture(t, options = {}) {
     origin,
     upstream,
     upstreamWork,
-    work,
+    runners: { prepare: prepareRunner, validate: validateRunner, publish: publishRunner },
+    staging,
     shas: { base: baseSha, main: mainSha, upstream: upstreamSha, candidate: candidateSha, race: raceSha },
+    runUrl,
+    markerDir,
     git,
-    validationEnvLog: join(root, "validation-env.json"),
-    syncEnv(extra = {}) {
-      return {
-        ...env,
-        GH_TOKEN: "fixture-token-value",
-        PSTACK_PI_GH: fakeGh,
-        FAKE_GH_LOG: join(root, "gh-log.jsonl"),
-        FAKE_GH_STATE: join(root, "gh-state.json"),
-        FAKE_GH_PR_LISTS: join(root, "pr-lists.json"),
-        ...(advanceCommand ? { FAKE_GH_ON_LIST: advanceCommand } : {}),
-        PSTACK_PI_RUN_URL: "https://github.com/toomanyopenfiles/plugins/actions/runs/12345",
-        PSTACK_PI_TEST_ENV_LOG: join(root, "validation-env.json"),
-        ...extra,
-      };
+    runPrepare(extra = {}) {
+      rmSync(staging.prepared, { recursive: true, force: true });
+      mkdirSync(staging.prepared, { recursive: true });
+      const outputFile = join(root, "prepare-output.txt");
+      const result = spawnStage(
+        prepareRunner,
+        ["prepare", "--staging", staging.prepared],
+        baseEnv({ GITHUB_TOKEN: "fixture-read-token", GITHUB_OUTPUT: outputFile, ...extra }),
+        outputFile,
+      );
+      const outcome = existsSync(outputFile)
+        ? /(?:^|\n)outcome=(\S+)/.exec(readFileSync(outputFile, "utf8"))?.[1]
+        : undefined;
+      return { ...result, outcome, prepared: staging.prepared };
     },
-    run(extra = {}) {
-      const result = spawnSync(process.execPath, [join(work, "scripts", "pstack-pi", "sync.mjs")], {
-        cwd: work,
-        encoding: "utf8",
-        env: { ...process.env, ...fixture.syncEnv(extra) },
-        timeout: 600_000,
-      });
-      return {
-        status: result.status,
-        output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
-        stdout: result.stdout ?? "",
-        stderr: result.stderr ?? "",
-      };
+    runValidate(extra = {}) {
+      rmSync(staging.validateInput, { recursive: true, force: true });
+      rmSync(staging.validated, { recursive: true, force: true });
+      if (existsSync(staging.prepared)) cpSync(staging.prepared, staging.validateInput, { recursive: true });
+      mkdirSync(staging.validated, { recursive: true });
+      const result = spawnStage(
+        validateRunner,
+        ["validate", "--staging", staging.validateInput, "--output", staging.validated],
+        baseEnv({ PSTACK_PI_MARKER_DIR: markerDir, ...extra }),
+        join(root, "validate-output.txt"),
+      );
+      return { ...result, input: staging.validateInput, outputDir: staging.validated };
+    },
+    /** Copy the staged files the way the publish job downloads its artifacts, without running it. */
+    stageForPublish() {
+      rmSync(staging.publishPrepared, { recursive: true, force: true });
+      rmSync(staging.publishValidated, { recursive: true, force: true });
+      if (existsSync(staging.prepared)) cpSync(staging.prepared, staging.publishPrepared, { recursive: true });
+      if (existsSync(staging.validated)) cpSync(staging.validated, staging.publishValidated, { recursive: true });
+      return { prepared: staging.publishPrepared, validated: staging.publishValidated };
+    },
+    runPublish(extra = {}) {
+      if (!existsSync(staging.publishPrepared) && !existsSync(staging.publishValidated)) fixture.stageForPublish();
+      const result = spawnStage(
+        publishRunner,
+        ["publish", "--prepared", staging.publishPrepared, "--validated", staging.publishValidated],
+        baseEnv({ GH_TOKEN: "fixture-write-token", ...extra }),
+        join(root, "publish-output.txt"),
+      );
+      return { ...result, prepared: staging.publishPrepared, validated: staging.publishValidated };
+    },
+    runRound(extra = {}) {
+      const prepare = fixture.runPrepare(extra.prepare);
+      if (prepare.outcome !== "proceed") return { prepare };
+      const validate = fixture.runValidate(extra.validate);
+      if (validate.status !== 0) return { prepare, validate };
+      const publish = fixture.runPublish(extra.publish);
+      return { prepare, validate, publish };
+    },
+    plan() {
+      return JSON.parse(readFileSync(join(staging.prepared, "plan.json"), "utf8"));
+    },
+    result() {
+      return JSON.parse(readFileSync(join(staging.validated, "result.json"), "utf8"));
     },
     ghCalls() {
-      const text = readFileSync(join(root, "gh-log.jsonl"), "utf8");
-      return text
+      return readFileSync(join(root, "gh-log.jsonl"), "utf8")
         .split("\n")
         .filter(Boolean)
         .map((line) => JSON.parse(line));
@@ -299,7 +372,10 @@ export function makeSyncFixture(t, options = {}) {
       return existsSync(path) ? readFileSync(path, "utf8").trim() : undefined;
     },
     canaryRan() {
-      return existsSync(join(work, "harness-generator-canary.txt"));
+      return existsSync(join(seed, "harness-generator-canary.txt")) || existsSync(join(prepareRunner, "harness-generator-canary.txt"));
+    },
+    candidateScriptRan() {
+      return existsSync(markerDir) && readdirSafe(markerDir).length > 0;
     },
     fileAt(ref, path) {
       return git(origin, ["show", `${ref}:${path}`], true);
@@ -311,8 +387,63 @@ export function makeSyncFixture(t, options = {}) {
       const result = git(origin, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], true);
       return result.status === 0 ? result.stdout.trim() : undefined;
     },
+    branchHead(runner) {
+      const result = git(runner, ["rev-parse", "--abbrev-ref", "HEAD"], true);
+      return result.status === 0 ? result.stdout.trim() : undefined;
+    },
+    /** Forge a validated package bundle, so a test can prove the publish stage rejects it. */
+    forgePackage({ mutate, commits = 1 }) {
+      const plan = fixture.plan();
+      const work = mkdtempSync(join(tmpdir(), "pstack-pi-forge-"));
+      try {
+        git(work, ["init", "-b", "forge"]);
+        git(work, ["fetch", join(staging.prepared, "candidate.bundle"), "refs/heads/pi-candidate:refs/heads/pi-candidate"]);
+        git(work, ["checkout", "pi-candidate"]);
+        mutate(work);
+        git(work, ["add", "-A"]);
+        configure(work, "forged");
+        git(work, ["commit", "-m", "forged validated package"]);
+        for (let index = 1; index < commits; index += 1) {
+          writeFileSync(join(work, OUTPUT, "forged-extra.md"), "forged extra commit\n");
+          git(work, ["add", "-A"]);
+          git(work, ["commit", "-m", `forged extra commit ${index}`]);
+        }
+        const tip = git(work, ["rev-parse", "HEAD"]).stdout.trim();
+        const bundle = join(staging.validated, "package.bundle");
+        rmSync(bundle, { force: true });
+        git(work, ["bundle", "create", bundle, "refs/heads/pi-candidate", "--not", plan.candidateTip]);
+        const resultPath = join(staging.validated, "result.json");
+        const result = JSON.parse(readFileSync(resultPath, "utf8"));
+        writeFileSync(
+          resultPath,
+          JSON.stringify({ ...result, outcome: "ok", step: null, exitCode: 0, regenerated: true, tip, candidateTip: plan.candidateTip }),
+        );
+        return { tip, bundle };
+      } finally {
+        rmSync(work, { recursive: true, force: true });
+      }
+    },
+    addPackageFile(dir, path, content) {
+      const target = join(dir, path);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, content);
+    },
+    addPackageSymlink(dir, path, target) {
+      const link = join(dir, path);
+      mkdirSync(dirname(link), { recursive: true });
+      symlinkSync(target, link);
+    },
+    configure,
   };
   return fixture;
+}
+
+function readdirSafe(dir) {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
 }
 
 function applyUpstreamChange(dir, kind) {
@@ -332,6 +463,12 @@ function applyUpstreamChange(dir, kind) {
   if (kind === "license") {
     const license = join(dir, "pstack", "LICENSE");
     writeFileSync(license, readFileSync(license, "utf8").replace(/^Copyright \(c\).*$/m, "All rights reserved."));
+    return;
+  }
+  if (kind === "tamper-generator" || kind === "tamper-check") {
+    const script = kind === "tamper-generator" ? "generate" : "check";
+    writeFileSync(skill, `${readFileSync(skill, "utf8")}\nUpstream note added by the cursor/plugins fixture.\n`);
+    writeFileSync(join(dir, "scripts", "pstack-pi", `${script}.mjs`), candidateScript(script));
     return;
   }
   throw new Error(`unknown upstream change: ${kind}`);
