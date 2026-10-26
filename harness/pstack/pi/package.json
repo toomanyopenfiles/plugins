@@ -1,0 +1,19 @@
+{
+  "name": "pstack",
+  "private": true,
+  "description": "pstack skills packaged for Pi",
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  },
+  "pi-subagents": {
+    "agents": [
+      "./agents"
+    ]
+  }
+}

@@ -1,0 +1,136 @@
+name: Pi candidate sync
+
+# Daily at 08:00 Asia/Shanghai (00:00 UTC), plus manual runs. A manual run is a repair path
+# only: it never unfreezes an open candidate pull request.
+#
+# Delivered as source only. Nothing runs until the fork installs the dedicated GitHub App,
+# stores its private key in the pstack-pi-write Environment, and disables the inherited
+# whole-tree harness check; see the README.
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pstack-pi-sync
+  cancel-in-progress: false
+
+jobs:
+  # Trusted control plane: everything here comes from the fork's main. It pins the round,
+  # honours the freeze, and merges the candidate branch without running any candidate code.
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      outcome: ${{ steps.round.outputs.outcome }}
+    steps:
+      - name: Check out trusted main for the control plane
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Add the read-only upstream repository
+        run: git remote add upstream https://github.com/cursor/plugins.git
+      - name: Pin the round, check the freeze, and merge the candidate branch
+        id: round
+        run: node scripts/pstack-pi/sync.mjs prepare --staging "$RUNNER_TEMP/prepared"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PSTACK_PI_REPOSITORY: toomanyopenfiles/plugins
+          PSTACK_PI_TRIGGER: ${{ github.event_name }}
+      - name: Hand the merged branch to the credential-free build
+        if: steps.round.outputs.outcome == 'proceed'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pstack-pi-prepared
+          path: ${{ runner.temp }}/prepared
+          if-no-files-found: error
+          retention-days: 1
+
+  # Untrusted side: no App key, no write token, and no Environment. The merged candidate
+  # source is only data for the scripts from main, and no candidate-carried script runs.
+  validate:
+    needs: prepare
+    if: needs.prepare.outputs.outcome == 'proceed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out trusted main for the build scripts
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Take the merged branch as data
+        uses: actions/download-artifact@v4
+        with:
+          name: pstack-pi-prepared
+          path: ${{ runner.temp }}/prepared
+      - name: Build and check the merged package
+        run: node scripts/pstack-pi/sync.mjs validate --staging "$RUNNER_TEMP/prepared" --output "$RUNNER_TEMP/validated"
+      - name: Hand the verified package to the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: pstack-pi-validated
+          path: ${{ runner.temp }}/validated
+          if-no-files-found: error
+          retention-days: 1
+
+  # Trusted publishing: reads scripts from main, receives the App key only through the
+  # protected Environment, and accepts candidate history only as strictly checked data.
+  publish:
+    needs: [prepare, validate]
+    if: needs.prepare.outputs.outcome == 'proceed' && needs.validate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: pstack-pi-write
+    steps:
+      - name: Check out trusted main for the publish script
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Take the prepared branch
+        uses: actions/download-artifact@v4
+        with:
+          name: pstack-pi-prepared
+          path: ${{ runner.temp }}/prepared
+      - name: Take the validated package
+        uses: actions/download-artifact@v4
+        with:
+          name: pstack-pi-validated
+          path: ${{ runner.temp }}/validated
+      - name: Mint the sync App token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PSTACK_PI_APP_ID }}
+          private-key: ${{ secrets.PSTACK_PI_APP_PRIVATE_KEY }}
+          owner: toomanyopenfiles
+          repositories: plugins
+      - name: Let git reuse the App token for the candidate push
+        run: gh auth setup-git --hostname github.com
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+      - name: Publish the verified candidate
+        run: node scripts/pstack-pi/sync.mjs publish --prepared "$RUNNER_TEMP/prepared" --validated "$RUNNER_TEMP/validated"
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PSTACK_PI_REPOSITORY: toomanyopenfiles/plugins
+          PSTACK_PI_TRIGGER: ${{ github.event_name }}
+          PSTACK_PI_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
