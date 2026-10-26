@@ -24,6 +24,12 @@ test("the checked-in validation workflow keeps the read-only validation and trus
   assert.deepEqual(workflowBoundaryProblems(workflowSource()), []);
 });
 
+test("the report pins the source run's immutable head, not the mutable PR association", () => {
+  const source = workflowSource();
+  assert.match(source, /EXPECTED_HEAD: \$\{\{ github\.event\.workflow_run\.head_sha \}\}/);
+  assert.doesNotMatch(source, /github\.event\.workflow_run\.pull_requests\[0\]\.head\.sha/);
+});
+
 test("the workflow boundary check runs as a static entry", () => {
   const result = runScript("validate.mjs");
   assert.equal(result.status, 0, result.stderr);
@@ -159,10 +165,18 @@ test("the validator keeps the report job on trusted workflow_run fields and the 
   expectProblem(
     (source) =>
       source.replace(
-        "EXPECTED_HEAD: ${{ github.event.workflow_run.pull_requests[0].head.sha }}",
+        "EXPECTED_HEAD: ${{ github.event.workflow_run.head_sha }}",
         "EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}",
       ),
     /report job uses the candidate pull_request event/,
+  );
+  expectProblem(
+    (source) =>
+      source.replace(
+        "EXPECTED_HEAD: ${{ github.event.workflow_run.head_sha }}",
+        "EXPECTED_HEAD: ${{ github.event.workflow_run.pull_requests[0].head.sha }}",
+      ),
+    /source run head|mutable pull request association head/,
   );
   expectProblem(
     (source) => source.replace("RUN_ID: ${{ github.event.workflow_run.id }}", "RUN_ID: ${{ github.run_id }}"),
@@ -331,6 +345,7 @@ test("the README documents local installation, the trusted report boundary, and 
     /stable\/candidate switcher/,
     /`pstack-pi-validate\.yml`/,
     /workflow_run/,
+    /immutable head SHA/,
     /pstack-pi-write/,
     /deployment branch policy/,
     /`main` only/,

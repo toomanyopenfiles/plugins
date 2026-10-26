@@ -253,7 +253,7 @@ export function workflowBoundaryProblems(text) {
 
   const controlledFields = [
     ["PR_NUMBER", "github.event.workflow_run.pull_requests[0].number"],
-    ["EXPECTED_HEAD", "github.event.workflow_run.pull_requests[0].head.sha"],
+    ["EXPECTED_HEAD", "github.event.workflow_run.head_sha"],
     ["SOURCE_EVENT", "github.event.workflow_run.event"],
     ["SOURCE_BRANCH", "github.event.workflow_run.head_branch"],
     ["SOURCE_BASE", "github.event.workflow_run.pull_requests[0].base.ref"],
@@ -266,6 +266,7 @@ export function workflowBoundaryProblems(text) {
   for (const [field, expression] of controlledFields) {
     if (!report.includes(`${field}: \${{ ${expression} }}`)) {
       const message = {
+        EXPECTED_HEAD: "report job does not use the source run head",
         RUN_ID: "report job does not use the validation run id",
         RUN_ATTEMPT: "report job does not use the validation run attempt",
         VALIDATION_RESULT: "report job does not use the workflow_run conclusion",
@@ -276,6 +277,10 @@ export function workflowBoundaryProblems(text) {
   const runUrl =
     "RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}";
   if (!report.includes(runUrl)) problems.push("report job log link is not the validation run");
+
+  if (report.includes("github.event.workflow_run.pull_requests[0].head.sha")) {
+    problems.push("report job attributes the result to the mutable pull request association head");
+  }
 
   const flags = [
     '--repo "$GITHUB_REPOSITORY"',

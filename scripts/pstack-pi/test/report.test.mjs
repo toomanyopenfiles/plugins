@@ -229,6 +229,18 @@ test("a run whose head is no longer current writes nothing", async (t) => {
   assert.deepEqual(writes(api.state), []);
 });
 
+test("a run that validated H1 cannot label a PR association now at H2", async (t) => {
+  // The source workflow run's immutable head_sha is H1. The pull_requests association
+  // (and the API's current PR head) has moved to H2 before this report runs.
+  const api = await startApi(t, { head: newerHead });
+  const result = await runReport(api, { head, outcome: "failure" });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /skip: stale-head/);
+  assert.equal(api.state.comments.length, 0);
+  assert.deepEqual(writes(api.state), []);
+});
+
 test("a head that changes before the report write is not overwritten", async (t) => {
   const api = await startApi(t, { headChanges: { 2: newerHead } });
   const result = await runReport(api);
@@ -269,12 +281,14 @@ test("a report for a previous head cannot replace the newer head report", async 
   const api = await startApi(t, { head: newerHead });
   assert.equal((await runReport(api, { head: newerHead, "run-id": "200" })).status, 0);
 
-  const late = await runReport(api, { head, "run-id": "201" });
+  const late = await runReport(api, { head, "run-id": "201", outcome: "failure" });
   assert.equal(late.status, 0);
   assert.match(late.stdout, /skip: stale-head/);
   assert.equal(api.state.comments.length, 1);
   assert.ok(api.state.comments[0].body.includes(newerHead));
   assert.doesNotMatch(api.state.comments[0].body, new RegExp(`Head: \`${head}\``));
+  assert.match(api.state.comments[0].body, /Result: \*\*passed\*\*/);
+  assert.doesNotMatch(api.state.comments[0].body, /Result: \*\*failed\*\*/);
 });
 
 test("candidate-controlled report values are rejected as data, not run as a command", async (t) => {

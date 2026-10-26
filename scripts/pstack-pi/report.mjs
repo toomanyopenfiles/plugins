@@ -48,6 +48,8 @@ export function renderReport({ head, outcome, runId, runAttempt, runUrl }) {
 }
 
 export async function publishReport({ repo, client, expectedHead, outcome, runId, runAttempt, runUrl, source }) {
+  // expectedHead is the source workflow run's immutable head_sha. The pull request
+  // association's current head can move, so every API read rejects a mismatch before writing.
   if (!isTrustedSource({ source, repo })) return { status: "skipped", reason: "untrusted-source" };
   const body = renderReport({ head: expectedHead, outcome, runId, runAttempt, runUrl });
 
