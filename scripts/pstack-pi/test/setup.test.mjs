@@ -46,7 +46,10 @@ const coverage = [
   [/inherit-parent/, "inherit-parent is mapped"],
   [/\bauto\b/, "auto is kept as an alias"],
   [/omit `model`/, "an unset role omits model"],
-  [/Pi resolves its normal default/, "an unset role follows host resolution"],
+  [
+    /Pi resolves (?:it|its model) (?:normally|with its normal)/,
+    "an unset role follows host resolution",
+  ],
   [/never fall back to the slug|never .*Cursor slug/i, "a missing role does not fall back to a Cursor slug"],
   [/report the role|Report a configured value that fails/i, "an explicit configuration failure is reported"],
   [/never swap in another model or drop a reasoning level/i, "no silent substitution or downgrade"],

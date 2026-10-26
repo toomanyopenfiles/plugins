@@ -106,15 +106,32 @@ export function makeSyncFixture(t, options = {}) {
     race = false,
     prLists = [[]],
     advanceUpstreamOnPrList = false,
+    hermeticIdentity = false,
+    failingPreMergeCommitHook = false,
   } = options;
 
   const root = mkdtempSync(join(tmpdir(), "pstack-pi-sync-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const gitConfig = join(root, "gitconfig");
-  writeFileSync(gitConfig, "");
+  // The fresh prepare runner is a clone, so it inherits no repository identity. With
+  // `useConfigOnly` Git refuses to guess an identity from the username and hostname, which makes
+  // "no ambient identity" reproducible on every host instead of only where Git declines to guess.
+  writeFileSync(gitConfig, hermeticIdentity ? "[user]\n\tuseConfigOnly = true\n" : "");
   const env = { ...process.env, GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_NOSYSTEM: "1" };
   for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GITHUB_OUTPUT", "PSTACK_PI_REPOSITORY", "PSTACK_PI_RUN_URL", "PSTACK_PI_TRIGGER"]) {
     delete env[key];
+  }
+  if (hermeticIdentity) {
+    // A temporary HOME, no identity variables, and no config injection: the prepare runner must
+    // supply its own author and committer rather than inherit the operator's.
+    const home = join(root, "home");
+    mkdirSync(home, { recursive: true });
+    env.HOME = home;
+    for (const key of Object.keys(env)) {
+      if (/^GIT_(?:AUTHOR|COMMITTER)_/.test(key) || key === "EMAIL" || /^GIT_CONFIG_(?:COUNT|PARAMETERS|KEY_|VALUE_)/.test(key)) {
+        delete env[key];
+      }
+    }
   }
 
   const git = (cwd, args, allowFailure = false) => {
@@ -203,6 +220,14 @@ export function makeSyncFixture(t, options = {}) {
   const publishRunner = join(root, "publish-runner");
   for (const runner of [prepareRunner, validateRunner, publishRunner]) git(root, ["clone", origin, runner]);
   git(prepareRunner, ["remote", "add", "upstream", upstream]);
+
+  // A hook failure is a merge failure that is not a source conflict: Git leaves MERGE_HEAD behind
+  // but nothing is unmerged, so the prepare stage must report the hook, not a conflict.
+  if (failingPreMergeCommitHook) {
+    const hook = join(prepareRunner, ".git", "hooks", "pre-merge-commit");
+    writeFileSync(hook, "#!/bin/sh\necho 'fixture pre-merge-commit hook refused the merge' >&2\nexit 1\n");
+    chmodSync(hook, 0o755);
+  }
 
   let raceSha;
   if (race) {

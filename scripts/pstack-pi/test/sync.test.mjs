@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  MAX_DIAGNOSTIC_CHARS,
   classifyPushFailure,
   failurePullRequestBody,
   pullRequestBody,
@@ -150,6 +151,25 @@ test("the validated result is rejected unless it belongs to the planned candidat
     [{ step: "deploy" }, /unknown failed step/],
     [{ regenerated: "yes" }, /regenerated flag/],
     [{ regenerated: true, tip: null }, /carries no commit/],
+    [
+      { outcome: "failed", step: "generate", exitCode: 1, regenerated: false, tip: null },
+      /has no failure diagnostics/,
+    ],
+    [
+      { outcome: "failed", step: "generate", exitCode: 1, regenerated: false, tip: null, diagnostics: "raw text" },
+      /failure diagnostics/,
+    ],
+    [
+      {
+        outcome: "failed",
+        step: "generate",
+        exitCode: 1,
+        regenerated: false,
+        tip: null,
+        diagnostics: { stdout: "x".repeat(MAX_DIAGNOSTIC_CHARS + 1), stderr: "", truncated: true },
+      },
+      /oversized/,
+    ],
   ]) {
     writeFileSync(join(dir, "result.json"), JSON.stringify({ ...aResult, ...patch }));
     assert.throws(() => readResult(dir, config, plan), message);
@@ -277,6 +297,14 @@ test("the normal round merges, builds without credentials, publishes, and opens 
   assert.match(skill, /Upstream note added by the cursor\/plugins fixture/);
   const identity = fixture.git(fixture.origin, ["log", "-1", "--format=%an", tip]).stdout.trim();
   assert.equal(identity, "pstack-pi-sync[bot]");
+  const bot = "pstack-pi-sync[bot] <pstack-pi-sync[bot]@users.noreply.github.com>";
+  const merges = fixture
+    .git(fixture.origin, ["log", "--merges", "--format=%an <%ae>|%cn <%ce>", tip])
+    .stdout.trim()
+    .split("\n")
+    .filter(Boolean);
+  assert.ok(merges.length >= 1, "the round creates ordinary merge commits");
+  for (const line of merges) assert.equal(line, `${bot}|${bot}`, "the merge commit carries the bot author and committer");
 
   const lists = fixture.pullRequestLists();
   assert.equal(lists.length, 3, "the freeze is checked by the prepare job, again before the push, and before opening the PR");
@@ -307,6 +335,27 @@ test("the normal round merges, builds without credentials, publishes, and opens 
       assert.ok(url.startsWith(fixture.root), `${remote} is a local only remote`);
     }
   }
+});
+
+test("prepare merges with its own bot identity when the runner has no ambient Git identity", (t) => {
+  const fixture = makeSyncFixture(t, { hermeticIdentity: true });
+  const { prepare, validate, publish } = fixture.runRound();
+  assert.equal(prepare.status, 0, prepare.output);
+  assert.equal(prepare.outcome, "proceed");
+  assert.equal(validate.status, 0, validate.output);
+  assert.equal(publish.status, 0, publish.output);
+
+  const bot = "pstack-pi-sync[bot] <pstack-pi-sync[bot]@users.noreply.github.com>";
+  const tip = fixture.tip();
+  assert.ok(tip, "the candidate branch was pushed");
+  const merges = fixture
+    .git(fixture.origin, ["log", "--merges", "--format=%an <%ae>|%cn <%ce>", tip])
+    .stdout.trim()
+    .split("\n")
+    .filter(Boolean);
+  assert.ok(merges.length >= 1, "the round created a merge commit without any ambient identity");
+  for (const line of merges) assert.equal(line, `${bot}|${bot}`, "the merge is authored and committed by the bot");
+  assert.doesNotMatch(fixture.git(fixture.origin, ["log", "-1", "--format=%ae %ce", tip]).stdout, /example\.test|gaosong/i);
 });
 
 test("the round keeps its pinned upstream commit even when upstream moves during the run", (t) => {
@@ -411,6 +460,27 @@ test("a merge conflict stops before any build or push", (t) => {
   assert.deepEqual(fixture.pullRequestsCreated(), []);
 });
 
+test("a merge failure that is not a source conflict keeps its own diagnostic", (t) => {
+  const fixture = makeSyncFixture(t, {
+    sources: false,
+    hermeticIdentity: true,
+    failingPreMergeCommitHook: true,
+  });
+  const prepare = fixture.runPrepare();
+  assert.equal(prepare.status, 1, prepare.output);
+  assert.match(prepare.output, /fixture pre-merge-commit hook refused the merge/, "the actual failure cause is reported");
+  assert.doesNotMatch(prepare.output, /merge conflict/i, "a hook failure is not called a source conflict");
+  assert.equal(existsSync(join(fixture.staging.prepared, "plan.json")), false, "no conflict plan is written");
+  assert.equal(fixture.tip(), undefined, "nothing was pushed");
+  assert.equal(fixture.git(fixture.runners.prepare, ["status", "--porcelain"]).stdout.trim(), "", "the failed merge leaves no staged state");
+  assert.notEqual(
+    fixture.git(fixture.runners.prepare, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"], true).status,
+    0,
+    "the failed merge is not left in progress",
+  );
+  assert.deepEqual(fixture.pullRequestsCreated(), []);
+});
+
 test("a push race stops without a force push", (t) => {
   const fixture = makeSyncFixture(t, { race: true });
   const { publish } = fixture.runRound();
@@ -426,10 +496,14 @@ test("a generation failure keeps the merged source and opens a draft that marks 
   const { prepare, validate, publish } = fixture.runRound();
   assert.equal(prepare.outcome, "proceed");
   assert.equal(validate.status, 0, validate.output);
+  assert.match(validate.output, /missing required bundled skill: cursor-team-kit\/skills\/deslop/, "the validation log carries the real cause");
+  assert.match(validate.output, /inert/, "captured output is labelled as inert text");
   const result = fixture.result();
   assert.equal(result.outcome, "failed");
   assert.equal(result.step, "generate");
   assert.equal(result.regenerated, false);
+  assert.equal(result.diagnostics.truncated, false);
+  assert.match(result.diagnostics.stderr, /missing required bundled skill: cursor-team-kit\/skills\/deslop/);
 
   assert.equal(publish.status, 1, publish.output);
   const tip = fixture.tip();
@@ -445,6 +519,7 @@ test("a generation failure keeps the merged source and opens a draft that marks 
   assert.match(created[0].body, /NOT a new candidate/);
   assert.match(created[0].body, /out of sync/);
   assert.match(created[0].body, /generate\.mjs/);
+  assert.match(created[0].body, /missing required bundled skill: cursor-team-kit\/skills\/deslop/, "the draft carries the failing output");
   assert.match(created[0].body, new RegExp(fixture.runUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
@@ -506,6 +581,80 @@ test("publish refuses a validated package that is more than one commit", (t) => 
   assert.notEqual(publish.status, 0);
   assert.match(publish.output, /not a single commit/);
   assert.deepEqual(fixture.pullRequestsCreated(), []);
+});
+
+test("publish refuses oversized failure diagnostics instead of carrying them", (t) => {
+  const fixture = makeSyncFixture(t);
+  fixture.runPrepare();
+  fixture.runValidate();
+  const result = fixture.result();
+  const staged = fixture.stageForPublish();
+  const oversized = "x".repeat(MAX_DIAGNOSTIC_CHARS + 1);
+  writeFileSync(
+    join(staged.validated, "result.json"),
+    JSON.stringify({
+      ...result,
+      outcome: "failed",
+      step: "generate",
+      exitCode: 1,
+      regenerated: false,
+      tip: null,
+      diagnostics: { stdout: "", stderr: oversized, truncated: true },
+    }),
+  );
+
+  const publish = fixture.runPublish();
+  assert.notEqual(publish.status, 0);
+  assert.match(publish.output, /diagnostics/);
+  assert.deepEqual(fixture.pullRequestsCreated(), []);
+});
+
+test("publish refuses malformed failure diagnostics instead of carrying them", (t) => {
+  for (const diagnostics of ["raw text", { stdout: 42, stderr: "", truncated: false }, { stdout: "", stderr: {}, truncated: false }]) {
+    const fixture = makeSyncFixture(t);
+    fixture.runPrepare();
+    fixture.runValidate();
+    const result = fixture.result();
+    const staged = fixture.stageForPublish();
+    writeFileSync(
+      join(staged.validated, "result.json"),
+      JSON.stringify({ ...result, outcome: "failed", step: "generate", exitCode: 1, regenerated: false, tip: null, diagnostics }),
+    );
+    const publish = fixture.runPublish();
+    assert.notEqual(publish.status, 0);
+    assert.match(publish.output, /diagnostics/);
+    assert.deepEqual(fixture.pullRequestsCreated(), []);
+  }
+});
+
+test("failure diagnostics stay inert text in the draft body", (t) => {
+  const fixture = makeSyncFixture(t);
+  fixture.runPrepare();
+  fixture.runValidate();
+  const result = fixture.result();
+  const staged = fixture.stageForPublish();
+  const marker = join(fixture.root, "diagnostic-executed-marker");
+  const hostile = `$(touch ${marker}) \`touch ${marker}\`\n::error::forged workflow command\n~~~ not a fence`;
+  writeFileSync(
+    join(staged.validated, "result.json"),
+    JSON.stringify({
+      ...result,
+      outcome: "failed",
+      step: "check",
+      exitCode: 1,
+      regenerated: false,
+      tip: null,
+      diagnostics: { stdout: hostile, stderr: hostile, truncated: false },
+    }),
+  );
+
+  const publish = fixture.runPublish();
+  assert.equal(publish.status, 1, publish.output);
+  const created = fixture.pullRequestsCreated();
+  assert.equal(created.length, 1);
+  assert.equal(created[0].draft, true);
+  assert.ok(created[0].body.includes(hostile), "the captured text is carried verbatim as data");
+  assert.equal(existsSync(marker), false, "captured text is never executed");
 });
 
 test("publish refuses a plan that targets another branch", (t) => {

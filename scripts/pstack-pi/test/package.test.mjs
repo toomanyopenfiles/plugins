@@ -71,7 +71,10 @@ test("generate builds a self-contained Pi package from the real sources", (t) =>
   assert.match(readme, /Do not edit/i);
   assert.match(readme, /scripts\/pstack-pi\/generate\.mjs/);
   assert.match(readme, /scripts\/pstack-pi\/check\.mjs/);
-  assert.match(readme, /not included|not yet|later tickets/i);
+  assert.match(readme, /pstack-pi-sync\.yml/);
+  assert.match(readme, /pstack-pi-validate\.yml/);
+  assert.match(readme, /delivered but not enabled or remotely verified/i);
+  assert.match(readme, /no remote workflow has run/i);
   assert.match(readFileSync(join(packageDir, "README.upstream.md"), "utf8"), /^# pstack/);
 
   const after = treeState(join(root, "harness"));

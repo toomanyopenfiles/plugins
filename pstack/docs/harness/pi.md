@@ -41,23 +41,23 @@ New work gets a new agent, but that is not an order to pass a fresh context ever
 
 | Cursor | Pi |
 | --- | --- |
-| `claude-<family>-<version>-<effort>[-fast]`, such as `claude-opus-5-5-xhigh` | Never pass the Cursor slug as `model`. Pass the role's value from the [role-model file](#role-model-file), or, when the role has none, omit `model` and Pi resolves its normal default. Report a configured value that fails; never swap in another model or drop a reasoning level silently, and never fall back to the slug the skill names. |
+| `claude-<family>-<version>-<effort>[-fast]`, such as `claude-opus-5-5-xhigh` | Never pass the Cursor slug as `model`. Pass the role's value from the [role-model file](#role-model-file), or, when the role has none, omit `model` and Pi resolves it normally. Report a configured value that fails; never swap in another model or drop a reasoning level silently, and never fall back to the slug the skill names. |
 | A `grok-*`, `gpt-*`, or other Cursor slug | Never pass it. The same rule applies: the role's configured value, or no `model`. |
-| `auto` or `inherit-parent` | Omit `model`. The role runs on the parent session model, which is how Auto users stay on Auto. |
+| `auto` or `inherit-parent` | Omit `model`. Pi then applies its normal resolution, which may take a native agent setting, an override, or the session default, so do not promise the parent session model. |
 | A `-fast` slug, such as `grok-4.7-xhigh-fast` | Not Pi's `fast: true`. In Cursor the suffix names a faster model variant; in Pi `fast: true` asks for the OpenAI priority service tier on a native `openai-codex` child, which can cost more and draw on a higher quota tier, and it fails before launch on any other provider. Keep the two apart: choose the intended Pi model id explicitly, and set `fast: true` only when the operator asks for that service tier. |
 | The `pstack-models.mdc` rule | Replace it with the role-model file below. Never write role lines into project instructions, and never set `defaultModel` or `defaultThinkingLevel`. Pi never reads `.mdc` files. If the file or a role's line is missing, omit `model` and say the role has no configured model. |
 
 ### Role model file
 
-`/setup-pstack` keeps the same wizard and writes the same roles to `<agent-dir>/pstack-models.md`, which is `~/.pi/agent/pstack-models.md` by default. Every role value is `provider/model-id:level`, where `level` is one of Pi's thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `auto`, `inherit-parent`, and a missing line all mean: omit `model`.
+`/setup-pstack` keeps the same wizard and writes the same roles to `<agent-dir>/pstack-models.md`, which is `~/.pi/agent/pstack-models.md` by default. Every role value is `provider/model-id:level`, where `level` is one of Pi's thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. `auto`, `inherit-parent`, and a missing line all mean: omit `model`, and the host resolves it normally.
 
 The skill's steps stay as written. Detect the models this session can actually pass: the `/model` picker, `/subagents-models`, or the values the operator names. Ask for one of the four budgets, then set `level` from it instead of rewriting an effort token inside a slug: `unlimited` sets `max`, `large` sets `xhigh`, `medium` sets `high`, and `small` sets `medium`. Pi clamps a level the chosen model does not support, and the wizard reports the level it wrote. Show the full role table with its model per role, mark any model this session cannot resolve as needing a choice, and ask for confirmation before writing. Keep every panel list: one child per entry, so the list length is the run count, and the same model repeated is that many runs of one model, not a cross-model review. Say so in the report rather than calling it one. Write the whole file on a rerun so the result is idempotent.
 
 The role labels, the panel lists, and the `# budget` line mirror step 5 of `skills/setup-pstack/SKILL.md`. The package check fails when the example below loses a role, shortens a panel, or drifts from the budget mapping, so change both or neither.
 
 ```text pstack-models
-# pstack role models for Pi. One line per role. Delete a line to fall back to the skill default.
-# `inherit-parent` or `auto` as a value: the role runs on the parent session model, so omit `model`.
+# pstack role models for Pi. One line per role. A role with no line omits `model`, so Pi resolves it normally.
+# `inherit-parent` or `auto` as a value: omit `model`; the host resolves it normally, not necessarily the parent model.
 # A panel list runs one child per entry, even when its entries share a model.
 # budget: large (xhigh)
 feature, refactoring: provider/model-id:high

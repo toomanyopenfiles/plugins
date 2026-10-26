@@ -32,6 +32,24 @@ const BOT = {
   email: "pstack-pi-sync[bot]@users.noreply.github.com",
 };
 
+/**
+ * Author and committer for every commit this script creates, ordinary merges included. Passed as
+ * both `-c` config and author/committer variables, so a fresh checkout needs no repository, user, or
+ * global Git configuration, and no ambient identity on the runner can replace it.
+ */
+const BOT_IDENTITY = {
+  config: ["-c", `user.name=${BOT.name}`, "-c", `user.email=${BOT.email}`],
+  env: {
+    GIT_AUTHOR_NAME: BOT.name,
+    GIT_AUTHOR_EMAIL: BOT.email,
+    GIT_COMMITTER_NAME: BOT.name,
+    GIT_COMMITTER_EMAIL: BOT.email,
+  },
+};
+
+/** Captured failure output crosses a job boundary and reaches a pull request, so it is bounded. */
+export const MAX_DIAGNOSTIC_CHARS = 4000;
+
 export class SyncError extends Error {
   constructor(message, exitCode = 1) {
     super(message);
@@ -108,6 +126,49 @@ function readJson(path, what) {
   }
 }
 
+/**
+ * Bound one captured stream, keeping the tail where a failure usually prints its cause. Control
+ * characters are dropped so the text stays readable data in a log line and in a PR body.
+ */
+function boundedDiagnostic(value) {
+  const text = String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+  if (text.length <= MAX_DIAGNOSTIC_CHARS) return { text, truncated: false };
+  return { text: text.slice(-MAX_DIAGNOSTIC_CHARS), truncated: true };
+}
+
+function diagnosticOf(run) {
+  const stdout = boundedDiagnostic(run.stdout);
+  const stderr = boundedDiagnostic(run.stderr);
+  return { stdout: stdout.text, stderr: stderr.text, truncated: stdout.truncated || stderr.truncated };
+}
+
+/**
+ * Print captured output as inert text. The per-line prefix keeps a `::` at the start of a line from
+ * being read as a workflow command, and nothing here is ever passed to a shell.
+ */
+function logInert(log, label, text) {
+  if (!text.trim()) return;
+  log(`--- ${label} (captured output, inert text; never executed) ---`);
+  for (const line of text.split("\n")) log(`| ${line}`);
+  log(`--- end ${label} ---`);
+}
+
+/** Fence captured text with more backticks than it contains, so it cannot end the block early. */
+function fenced(text) {
+  const longest = Math.max(0, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}text\n${text}\n${fence}`;
+}
+
+function diagnosticFence(diagnostics) {
+  const sections = [];
+  if (diagnostics.stderr.trim() !== "") sections.push(`stderr:\n${diagnostics.stderr.trim()}`);
+  if (diagnostics.stdout.trim() !== "") sections.push(`stdout:\n${diagnostics.stdout.trim()}`);
+  return fenced(sections.length > 0 ? sections.join("\n\n") : "(the failed step printed no output)");
+}
+
 function expect(condition, message) {
   if (!condition) throw new SyncError(message);
 }
@@ -122,15 +183,15 @@ function setStepOutput(name, value) {
 }
 
 function gitRunner(cwd, env) {
-  return (args) => {
-    const result = spawnSync("git", args, { cwd, encoding: "utf8", env, timeout: 300_000 });
+  return (args, overrides) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8", env: overrides ? { ...env, ...overrides } : env, timeout: 300_000 });
     if (result.error) throw new SyncError(`cannot run git: ${result.error.message}`);
     return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   };
 }
 
-function gitOrFail(git, args, what) {
-  const result = git(args);
+function gitOrFail(git, args, what, overrides) {
+  const result = git(args, overrides);
   if (result.status !== 0) {
     throw new SyncError(`${what} failed: ${(result.stderr || result.stdout).trim()}`);
   }
@@ -244,6 +305,23 @@ export function readResult(dir, config, plan) {
   expect(result.step === null || result.step === "generate" || result.step === "check", "the validated result has an unknown failed step");
   expect(Number.isInteger(result.exitCode) && result.exitCode >= 0 && result.exitCode <= 127, "the validated result has an invalid exit code");
   expect(typeof result.regenerated === "boolean", "the validated result has no regenerated flag");
+  if (result.outcome === "failed") {
+    const diagnostics = result.diagnostics;
+    expect(
+      diagnostics && typeof diagnostics === "object" && !Array.isArray(diagnostics),
+      "the validated result has no failure diagnostics",
+    );
+    expect(
+      typeof diagnostics.stdout === "string" && typeof diagnostics.stderr === "string" && typeof diagnostics.truncated === "boolean",
+      "the validated result has invalid failure diagnostics",
+    );
+    expect(
+      diagnostics.stdout.length <= MAX_DIAGNOSTIC_CHARS && diagnostics.stderr.length <= MAX_DIAGNOSTIC_CHARS,
+      "the validated result carries oversized failure diagnostics",
+    );
+  } else {
+    expect(result.diagnostics === null || result.diagnostics === undefined, "a successful result carries failure diagnostics");
+  }
   expect(SHA.test(result.candidateTip ?? ""), "the validated result has no candidate tip");
   expect(result.candidateTip === plan.candidateTip, "the validated result belongs to a different candidate tip");
   expect(result.tip === null || SHA.test(result.tip ?? ""), "the validated result has an invalid tip");
@@ -367,10 +445,31 @@ export function runPrepare({ root = defaultRoot(), staging, env = process.env, l
   }
 
   function mergeInto(ref, label) {
-    const result = git(["merge", "--no-edit", "-m", `sync: merge ${label} into ${config.candidateBranch}`, ref]);
+    const result = git(
+      [
+        ...BOT_IDENTITY.config,
+        "merge",
+        "--no-edit",
+        "-m",
+        `sync: merge ${label} into ${config.candidateBranch}`,
+        ref,
+      ],
+      BOT_IDENTITY.env,
+    );
     if (result.status === 0) return undefined;
-    git(["merge", "--abort"]);
-    return { label, output: `${result.stderr}\n${result.stdout}`.trim() };
+
+    // A failed merge is a source conflict only when Git actually stopped with unmerged index
+    // entries. Anything else - a missing identity, a hook, bad configuration, a broken repository -
+    // is reported with its own diagnostic, so the run names the cause the operator has to fix.
+    const inMerge = git(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).status === 0;
+    const unmerged = inMerge ? git(["ls-files", "--unmerged"]) : undefined;
+    const conflicted = inMerge && unmerged.status === 0 && unmerged.stdout.trim() !== "";
+    if (inMerge) git(["merge", "--abort"]);
+    const output = `${result.stderr}\n${result.stdout}`.trim();
+    if (conflicted) return { label, output };
+    throw new SyncError(
+      `merging ${label} into ${config.candidateBranch} failed without leaving a source conflict to resolve: ${output || "git printed no diagnostic"}`,
+    );
   }
 }
 
@@ -403,12 +502,10 @@ export function runValidate({ root = defaultRoot(), staging, output, env = proce
 
     const generate = runTrusted(root, "generate", work, env);
     const check = generate.status === 0 ? runTrusted(root, "check", work, env) : undefined;
-    const failure =
-      generate.status !== 0
-        ? { step: "generate", exitCode: generate.status }
-        : check && check.status !== 0
-          ? { step: "check", exitCode: check.status }
-          : undefined;
+    const failed = generate.status !== 0 ? generate : check && check.status !== 0 ? check : undefined;
+    const failure = failed
+      ? { step: generate.status !== 0 ? "generate" : "check", exitCode: failed.status, diagnostics: diagnosticOf(failed) }
+      : undefined;
 
     const result = {
       schema: RESULT_SCHEMA,
@@ -418,26 +515,25 @@ export function runValidate({ root = defaultRoot(), staging, output, env = proce
       regenerated: false,
       tip: plan.candidateTip,
       candidateTip: plan.candidateTip,
+      diagnostics: failure?.diagnostics ?? null,
     };
 
     if (failure) {
       log(`${failure.step} failed (exit ${failure.exitCode}); the merged source stays and the package is not updated`);
+      logInert(log, `${failure.step} stdout`, failure.diagnostics.stdout);
+      logInert(log, `${failure.step} stderr`, failure.diagnostics.stderr);
+      if (failure.diagnostics.truncated) {
+        log(`(each captured stream is bounded to its last ${MAX_DIAGNOSTIC_CHARS} characters)`);
+      }
     } else {
       log("the package builds and the static check passes");
       gitOrFail(git, ["add", "-A", "--", OUTPUT], `staging ${OUTPUT}`);
       if (git(["diff", "--cached", "--quiet"]).status !== 0) {
         gitOrFail(
           git,
-          [
-            "-c",
-            `user.name=${BOT.name}`,
-            "-c",
-            `user.email=${BOT.email}`,
-            "commit",
-            "-m",
-            `sync: regenerate the Pi package for ${UPSTREAM}@${short(plan.pinned)}`,
-          ],
+          [...BOT_IDENTITY.config, "commit", "-m", `sync: regenerate the Pi package for ${UPSTREAM}@${short(plan.pinned)}`],
           "committing the regenerated package",
+          BOT_IDENTITY.env,
         );
         result.regenerated = true;
         result.tip = revParse(git, "HEAD");
@@ -539,7 +635,14 @@ export function runPublish({ root = defaultRoot(), prepared, validated, env = pr
   const draft = result.outcome === "failed";
   const title = pullRequestTitle({ pinned: plan.pinned, stale: draft });
   const body = draft
-    ? failurePullRequestBody({ config, pinned: plan.pinned, step: result.step, exitCode: result.exitCode, runUrl: config.runUrl })
+    ? failurePullRequestBody({
+        config,
+        pinned: plan.pinned,
+        step: result.step,
+        exitCode: result.exitCode,
+        runUrl: config.runUrl,
+        diagnostics: result.diagnostics,
+      })
     : pullRequestBody({ config, pinned: plan.pinned });
   const pullRequest = github.createPullRequest({ title, body, draft });
   const message = draft
@@ -623,15 +726,18 @@ No model, product agent, MCP server, or remote workflow ran in this sync; the pa
 `;
 }
 
-export function failurePullRequestBody({ config, pinned, step, exitCode, runUrl }) {
+export function failurePullRequestBody({ config, pinned, step, exitCode, runUrl, diagnostics }) {
   const script = step === "check" ? "check.mjs" : "generate.mjs";
+  const captured = diagnostics
+    ? `\nThe failing step's captured output (at most the last ${MAX_DIAGNOSTIC_CHARS} characters per stream) is inert text, kept as data only:\n\n${diagnosticFence(diagnostics)}\n`
+    : "";
   return `Draft: this pull request is NOT a new candidate.
 
 The merged source is committed on \`${config.candidateBranch}\`, but the Pi package was not rebuilt, so \`${OUTPUT}/\` here is the previous package and is out of sync with this round's source. Do not review it as a candidate for \`${UPSTREAM}@${pinned}\`.
 
 - Pinned upstream commit: \`${UPSTREAM}@${pinned}\`
 - Failed step: \`node scripts/pstack-pi/${script}\` (exit ${Number.isInteger(exitCode) ? exitCode : 1})
-${runUrl ? `- Workflow log: ${runUrl}\n` : ""}
+${runUrl ? `- Workflow log: ${runUrl}\n` : ""}${captured}
 Fix the failure on \`${config.candidateBranch}\` with ordinary commits, then re-run the checks. Nothing from the failed build was committed and nothing was force-pushed.
 
 No model, product agent, MCP server, or remote workflow ran in this sync; the package build and the static check are the only steps.
