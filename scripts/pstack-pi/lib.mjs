@@ -8,6 +8,45 @@ export const AGENTS_OUTPUT = "agents";
 /** The public adapter this package ships, as a package-relative path. */
 export const ADAPTER_OUTPUT = "docs/harness/pi.md";
 export const ADAPTER_SOURCE = "pstack/docs/harness/pi.md";
+/** MCP is the one host difference with its own flow, so it ships as a second document. */
+export const MCP_FLOW_SOURCE = "pstack/docs/harness/pi/mcp-setup.md";
+export const MCP_FLOW_OUTPUT = "docs/harness/pi/mcp-setup.md";
+/** Pi's thinking levels, in the order Pi lists them. */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/** The setup skill's four budgets and the level each one asks for on Pi. */
+export const BUDGET_LEVELS = { unlimited: "max", large: "xhigh", medium: "high", small: "medium" };
+const ROLE_ALIASES = new Set(["auto", "inherit-parent"]);
+const MODEL_VALUE = /^[a-z0-9][a-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*(?::([a-z]+))?$/;
+const AGENT_OVERRIDE_NAME = /^[a-z0-9][a-z0-9._-]*$/;
+const TOOL_NAME = /^[a-z][a-z0-9_.-]*$/;
+const MCP_SELECTION = /^mcp:([A-Za-z0-9_-]+)(?:\/([A-Za-z0-9_-]+))?$/;
+const SERVER_NAME = /^[A-Za-z0-9_-]+$/;
+const SERVER_URL = /^https?:\/\//;
+const EXPOSURES = new Set(["codemode", "deferred", "direct", "hidden"]);
+const SERVER_TYPES = new Set(["stdio", "http", "streamable-http"]);
+/** pi-subagents 0.81.0's supported `subagents.agentOverrides.<name>` fields. */
+const OVERRIDE_FIELDS = new Set([
+  "description",
+  "advertise",
+  "machine",
+  "output",
+  "outputMode",
+  "defaultReads",
+  "model",
+  "defaultProvider",
+  "thinking",
+  "systemPromptMode",
+  "inheritProjectContext",
+  "inheritGlobalContext",
+  "inheritSkills",
+  "defaultContext",
+  "acceptanceRole",
+  "disabled",
+  "skills",
+  "tools",
+  "systemPrompt",
+]);
+const LITERAL_CREDENTIAL = /^(?:Bearer\s+[A-Za-z0-9._-]{8,}|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{10,}|xox[baprs]-[A-Za-z0-9-]{10,})/;
 /** The three agents this package publishes, by file name. `package: pstack` makes them `pstack.<name>`. */
 export const AGENTS = ["comment-sicko", "helper", "poteto-agent"];
 
@@ -52,6 +91,8 @@ const HOST_TERMS = [
   { key: "gpt-", re: /\bgpt-\d/ },
   { key: "inherit-parent", re: /inherit-parent/ },
   { key: "pstack-models.mdc", re: /pstack-models\.mdc/ },
+  { key: "MCP", re: /MCP/ },
+  { key: "create-skill", re: /create-skill/ },
   { key: ".cursor/skills/", re: /\.cursor\/skills/ },
   { key: "~/.cursor/plugins/", re: /\.cursor\/plugins|\.cursor-plugin/ },
   { key: ".cursor/rules/", re: /\.cursor\/rules|always-applied rule/ },
@@ -196,7 +237,7 @@ export function inventory(root) {
   for (const name of pstackSkills) {
     if (BUNDLED_SKILLS.includes(name)) problems.push(`skill name conflict: ${name} exists in pstack/skills and a bundled skill`);
   }
-  for (const path of ["pstack/docs/guide", ADAPTER_SOURCE, "pstack/README.md", "pstack/LICENSE", "cursor-team-kit/LICENSE"]) {
+  for (const path of ["pstack/docs/guide", ADAPTER_SOURCE, MCP_FLOW_SOURCE, "pstack/README.md", "pstack/LICENSE", "cursor-team-kit/LICENSE"]) {
     const abs = sourcePath(root, path);
     const wanted = path.endsWith("LICENSE") || path.endsWith(".md") ? isFile(abs) : isDirectory(abs);
     if (!wanted) problems.push(`missing required source ${path}`);
@@ -367,6 +408,7 @@ export function mapSourcePath(sourceRel) {
   }
   if (path === "pstack/README.md") return "README.upstream.md";
   if (path === ADAPTER_SOURCE) return ADAPTER_OUTPUT;
+  if (path === MCP_FLOW_SOURCE) return MCP_FLOW_OUTPUT;
   return null;
 }
 
@@ -460,6 +502,327 @@ export function linkProblems(files, root, sources = new Map()) {
   return problems;
 }
 
+/**
+ * Fenced blocks this package checks: an info string of `text pstack-models` or `json pstack-*`
+ * marks an example that the check validates against the host shape instead of trusting prose.
+ */
+export function taggedExamples(text) {
+  const found = new Map();
+  const block = /^```[A-Za-z0-9-]+[ \t]+(pstack-[a-z0-9-]+)[ \t]*\r?\n([\s\S]*?)^```[ \t]*$/gm;
+  for (const match of text.matchAll(block)) {
+    if (!found.has(match[1])) found.set(match[1], []);
+    found.get(match[1]).push(match[2]);
+  }
+  return found;
+}
+
+/** The `# budget` line and one entry per role, from a role-model block or the setup skill's example. */
+export function roleTable(text) {
+  const lines = [];
+  let budget = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    if (line.trim() === "") continue;
+    const budgetLine = /^#\s*budget:\s*([a-z]+)\s*\(([a-z]+)\)\s*$/.exec(line);
+    if (budgetLine) {
+      budget = { label: budgetLine[1], level: budgetLine[2] };
+      continue;
+    }
+    if (/^\s*#/.test(line) || /^---\s*$/.test(line) || /^(description|alwaysApply|name):/.test(line)) continue;
+    const at = line.indexOf(": ");
+    if (at < 0) {
+      lines.push({ problem: `"${line.trim()}" is not a role: value line` });
+      continue;
+    }
+    const labels = line.slice(0, at).split(",").map((value) => value.trim()).filter(Boolean);
+    const values = line.slice(at + 2).split(",").map((value) => value.trim()).filter(Boolean);
+    if (labels.length > 0 && values.length > 0) lines.push({ labels, values });
+  }
+  return { budget, lines };
+}
+
+/**
+ * Validate a Pi role-model file. With `options.roles`, the file also has to keep every role the
+ * setup skill names, with the same panel length, because the documented example mirrors it.
+ */
+export function roleModelProblems(text, options = {}) {
+  const problems = [];
+  const table = roleTable(text);
+  if (!table.budget) problems.push("the role example has no # budget line");
+  else {
+    const wanted = BUDGET_LEVELS[table.budget.label];
+    if (!wanted) problems.push(`budget "${table.budget.label}" is not one of ${Object.keys(BUDGET_LEVELS).join(", ")}`);
+    else if (table.budget.level !== wanted) {
+      problems.push(`budget "${table.budget.label}" must use level ${wanted}, not "${table.budget.level}"`);
+    }
+  }
+  if (table.lines.length === 0) problems.push("the role example has no role lines");
+
+  const seen = new Map();
+  for (const line of table.lines) {
+    if (line.problem) {
+      problems.push(line.problem);
+      continue;
+    }
+    for (const label of line.labels) {
+      if (seen.has(label)) problems.push(`role "${label}" appears twice`);
+      else seen.set(label, line);
+    }
+    for (const value of line.values) {
+      if (ROLE_ALIASES.has(value)) continue;
+      const match = MODEL_VALUE.exec(value);
+      if (!match) {
+        problems.push(
+          `role "${line.labels.join(", ")}" uses "${value}", which is not provider/model-id:level, auto, or inherit-parent`,
+        );
+        continue;
+      }
+      if (match[1] && !THINKING_LEVELS.includes(match[1])) {
+        problems.push(`level "${match[1]}" in "${value}" is not one of Pi's thinking levels: ${THINKING_LEVELS.join(", ")}`);
+      }
+    }
+  }
+
+  const roles = options.roles;
+  if (roles) {
+    const sourceLabels = [...new Set(roles.lines.flatMap((line) => line.labels))];
+    const missing = sourceLabels.filter((label) => !seen.has(label));
+    if (missing.length > 0) problems.push(`the role example is missing ${missing.join(", ")}`);
+    const extra = [...seen.keys()].filter((label) => !sourceLabels.includes(label));
+    if (extra.length > 0) problems.push(`the role example names roles the skill no longer has: ${extra.join(", ")}`);
+    for (const line of roles.lines) {
+      const match = table.lines.find((candidate) => candidate.labels.join(",") === line.labels.join(","));
+      if (!match) continue;
+      if (match.values.length !== line.values.length) {
+        problems.push(
+          `the example gave ${line.labels.join(", ")} ${match.values.length} entries instead of ${line.values.length}; each entry runs one child`,
+        );
+      }
+    }
+  }
+  return problems;
+}
+
+/** The setup skill's role example, which the Pi role-model block mirrors. */
+function setupRoleTable(root) {
+  const path = join(root, "pstack", "skills", "setup-pstack", "SKILL.md");
+  if (!isFile(path)) return null;
+  const text = readFileSync(path, "utf8");
+  const tagged = taggedExamples(text).get("pstack-models")?.[0];
+  if (tagged) return roleTable(tagged);
+  for (const match of text.matchAll(/^```[a-z]*\r?\n([\s\S]*?)^```$/gm)) {
+    if (/^# budget:/m.test(match[1])) return roleTable(match[1]);
+  }
+  return null;
+}
+
+function credentialProblems(server, path, problems) {
+  const visit = (value, at) => {
+    if (typeof value === "string") {
+      if (LITERAL_CREDENTIAL.test(value)) {
+        problems.push(`server "${server}" holds a literal credential at ${at}; use an environment reference such as \${NAME} or !command`);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => visit(entry, `${at}[${index}]`));
+      return;
+    }
+    if (value && typeof value === "object") {
+      for (const [key, entry] of Object.entries(value)) visit(entry, at ? `${at}.${key}` : key);
+    }
+  };
+  visit(server, path);
+}
+
+/** Validate an `mcpServers` example against the shape Pi's MCP documentation reads. */
+export function mcpServersProblems(config) {
+  const problems = [];
+  const servers = config?.mcpServers;
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) return ["the example has no mcpServers object"];
+  const normalized = new Map();
+  for (const [name, server] of Object.entries(servers)) {
+    if (!SERVER_NAME.test(name)) problems.push(`server "${name}" is not a valid server name: letters, digits, "_", and "-" only`);
+    const key = name.replace(/-/g, "_");
+    if (normalized.has(key)) problems.push(`servers "${normalized.get(key)}" and "${name}" differ only in "-" and "_"`);
+    else normalized.set(key, name);
+    if (!server || typeof server !== "object" || Array.isArray(server)) {
+      problems.push(`server "${name}" is not an object`);
+      continue;
+    }
+    if (server.type === "sse") problems.push(`server "${name}" uses the removed "sse" transport; use a "url" for streamable HTTP`);
+    else if (server.type !== undefined && !SERVER_TYPES.has(server.type)) {
+      problems.push(`server "${name}" has an unknown type "${server.type}"; use stdio, http, or streamable-http`);
+    }
+    const hasCommand = typeof server.command === "string" && server.command.trim() !== "";
+    const hasUrl = typeof server.url === "string" && server.url.trim() !== "";
+    if (hasCommand === hasUrl) problems.push(`server "${name}" needs exactly one of "command" or "url"`);
+    if (hasUrl && !SERVER_URL.test(server.url)) problems.push(`server "${name}" has a "url" that is not http or https`);
+    if (server.args !== undefined && (!Array.isArray(server.args) || server.args.some((arg) => typeof arg !== "string"))) {
+      problems.push(`server "${name}" has "args" that is not a list of strings`);
+    }
+    if (server.exposure !== undefined && !EXPOSURES.has(server.exposure)) {
+      problems.push(`server "${name}" has exposure "${server.exposure}", which is not a tool exposure (${[...EXPOSURES].join(", ")})`);
+    }
+    credentialProblems(server, "", problems);
+  }
+  return problems;
+}
+
+/** Validate `subagents.agentOverrides`, including the static `mcp:` selections in `tools`. */
+export function agentOverrideProblems(overrides, options = {}) {
+  const problems = [];
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) return ["the agent overrides are not an object"];
+  const servers = options.servers?.mcpServers ?? options.servers ?? {};
+  for (const [agent, fields] of Object.entries(overrides)) {
+    if (!AGENT_OVERRIDE_NAME.test(agent)) problems.push(`"${agent}" is not an agent name`);
+    if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+      problems.push(`agent "${agent}" has no field object`);
+      continue;
+    }
+    for (const field of Object.keys(fields)) {
+      if (!OVERRIDE_FIELDS.has(field)) problems.push(`"${field}" is not a supported agent override field`);
+    }
+    const tools = fields.tools;
+    if (tools === undefined) continue;
+    if (!Array.isArray(tools) || tools.length === 0) {
+      problems.push(`agent "${agent}" has a tools override that is not a non-empty list`);
+      continue;
+    }
+    let plain = 0;
+    let selected = 0;
+    for (const tool of tools) {
+      if (typeof tool !== "string" || tool.trim() === "") {
+        problems.push(`agent "${agent}" has a tools entry that is not a name`);
+        continue;
+      }
+      if (/^[+-]/.test(tool)) {
+        problems.push(
+          `"${tool}" is not a tool name: pi-subagents 0.81.0 reads an agent tools list as a strict allowlist, so "${tool}" never adds ${tool.slice(1)} and the launch fails; write plain tool names`,
+        );
+        continue;
+      }
+      const selection = MCP_SELECTION.exec(tool);
+      if (selection) {
+        selected += 1;
+        if (!Object.hasOwn(servers, selection[1])) {
+          problems.push(`"${tool}" names a server the configured servers do not define`);
+        } else if (servers[selection[1]]?.exposure === "hidden") {
+          problems.push(`"${tool}" selects a server configured "hidden"; a hidden server cannot be selected`);
+        }
+        continue;
+      }
+      if (!TOOL_NAME.test(tool)) problems.push(`"${tool}" is not a tool name or an mcp:<server>/<tool> selection`);
+      else plain += 1;
+    }
+    if (selected > 0 && plain === 0) {
+      problems.push(`agent "${agent}" keeps only MCP tools; keep the normal and extension tools the agent already uses`);
+    }
+  }
+  return problems;
+}
+
+/** The MCP flow merges one field per named agent, so a preview that changes anything else is rejected. */
+export function mcpPreviewProblems(preview, options = {}) {
+  const overrides = preview?.agentOverrides;
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) {
+    return ['the preview is not shaped as { "agentOverrides": { "<agent>": { "tools": [...] } } }'];
+  }
+  const problems = [];
+  for (const [agent, fields] of Object.entries(overrides)) {
+    if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+      problems.push(`the preview for ${agent} is not a field object`);
+      continue;
+    }
+    for (const field of Object.keys(fields)) {
+      if (field !== "tools") {
+        problems.push(`the preview changes subagents.agentOverrides.${agent}.${field}; the MCP flow merges only the tools field of subagents.agentOverrides`);
+      }
+    }
+  }
+  problems.push(...agentOverrideProblems(overrides, options));
+  return problems;
+}
+
+/** Apply a confirmed preview to a settings file, touching only the fields the preview names. */
+export function mergeAgentOverrides(settings, preview) {
+  const merged = JSON.parse(JSON.stringify(settings ?? {}));
+  for (const [agent, fields] of Object.entries(preview?.agentOverrides ?? {})) {
+    merged.subagents ??= {};
+    merged.subagents.agentOverrides ??= {};
+    merged.subagents.agentOverrides[agent] = {
+      ...(merged.subagents.agentOverrides[agent] ?? {}),
+      ...JSON.parse(JSON.stringify(fields)),
+    };
+  }
+  return merged;
+}
+
+/** Validate every tagged example this package ships, so a doc example cannot drift from the host shape. */
+function docExampleProblems(files, root) {
+  const problems = [];
+  const found = new Map();
+  for (const [path, { bytes }] of files) {
+    if (!path.endsWith(".md")) continue;
+    for (const [kind, bodies] of taggedExamples(bytes.toString("utf8"))) {
+      if (!found.has(kind)) found.set(kind, []);
+      for (const body of bodies) found.get(kind).push({ path, body });
+    }
+  }
+  const single = (kind) => {
+    const entries = found.get(kind) ?? [];
+    if (entries.length !== 1) problems.push(`${OUTPUT} ships ${entries.length} ${kind} examples; it needs exactly one`);
+    return entries[0];
+  };
+
+  const roles = setupRoleTable(root);
+  const models = single("pstack-models");
+  if (!roles) problems.push("pstack/skills/setup-pstack/SKILL.md no longer carries a # budget role example");
+  if (models) {
+    for (const problem of roleModelProblems(models.body, { roles: roles ?? undefined })) {
+      problems.push(`${OUTPUT}/${models.path}: ${problem}`);
+    }
+  }
+
+  const servers = single("pstack-mcp-servers");
+  let serverNames = {};
+  if (servers) {
+    let config;
+    try {
+      config = JSON.parse(servers.body);
+    } catch {
+      problems.push(`${OUTPUT}/${servers.path}: the mcpServers example is not valid JSON`);
+    }
+    if (config) {
+      for (const problem of mcpServersProblems(config)) problems.push(`${OUTPUT}/${servers.path}: ${problem}`);
+      serverNames = config.mcpServers ?? {};
+    }
+  }
+
+  const merge = single("pstack-agent-overrides-merge");
+  if (merge) {
+    let parsed;
+    try {
+      parsed = JSON.parse(merge.body);
+    } catch {
+      problems.push(`${OUTPUT}/${merge.path}: the agent override example is not valid JSON`);
+    }
+    if (parsed) {
+      for (const problem of mcpPreviewProblems(parsed.preview, { servers: serverNames })) {
+        problems.push(`${OUTPUT}/${merge.path}: ${problem}`);
+      }
+      for (const problem of agentOverrideProblems(parsed.after?.subagents?.agentOverrides, { servers: serverNames })) {
+        problems.push(`${OUTPUT}/${merge.path}: ${problem}`);
+      }
+      const merged = mergeAgentOverrides(parsed.before, parsed.preview);
+      if (JSON.stringify(merged) !== JSON.stringify(parsed.after)) {
+        problems.push(`${OUTPUT}/${merge.path}: the "after" settings are not the preview merged into "before"`);
+      }
+    }
+  }
+  return problems;
+}
+
 const README = `# pstack for Pi
 
 This directory is generated by \`node scripts/pstack-pi/generate.mjs\`. Do not edit anything under \`harness/pstack/pi/\` by hand. Change the sources under \`pstack/\`, \`cursor-team-kit/skills/\`, or \`scripts/pstack-pi/agents/helper.md\`, regenerate, and commit the result.
@@ -480,14 +843,30 @@ The output records no timestamp and no artifact hash, so repeated generation fro
 - The complete \`deslop\`, \`control-cli\`, and \`control-ui\` skill directories from \`cursor-team-kit/skills/\`, not just their entry documents.
 - Three agents in \`agents/\`, discovered through the manifest's \`pi-subagents.agents\`: \`pstack.poteto-agent\` and \`pstack.comment-sicko\`, converted from the Cursor agents only where Pi differs, and \`pstack.helper\`, a neutral delegate whose role comes from the brief it is given. The two converted agents keep their original responsibility, body, and output contract: the background field becomes \`async\`, the Cursor plugin lookup becomes a Pi skill lookup, and each points at the adapter. \`pstack.helper\` appends to Pi's normal prompt and inherits project instructions, the operator's global instructions, and the skills catalog. \`pstack.poteto-agent\` and \`pstack.helper\` carry the native \`allowNestedSubagents\` grant; none of the three sets a model, a thinking level, or a tool or extension allowlist.
 - The Pi adapter at \`docs/harness/pi.md\`, generated from \`pstack/docs/harness/pi.md\`. A packaged skill gains one entry paragraph that points at it only when the skill directory names a known host difference such as \`Task\`, \`generalPurpose\`, \`run_in_background\`, or a Cursor path. The source skills are never edited, and the adapter is read locally instead of fetched.
+- The MCP flow at \`docs/harness/pi/mcp-setup.md\`, generated from \`pstack/docs/harness/pi/mcp-setup.md\`. It is the one host difference with its own flow, and the adapter links it locally.
 - The pstack guide in \`docs/guide/\`, the upstream pstack README as \`README.upstream.md\`, and both MIT licenses: \`LICENSE\` for pstack and \`licenses/cursor-team-kit-LICENSE\` for the bundled Cursor Team Kit skills. The copyright lines are kept verbatim.
 - \`package.json\` declares \`pi.skills\` as \`./skills\` and \`pi-subagents.agents\` as \`./agents\`, the native Pi and pi-subagents discovery fields. The same skills also live in the conventional \`skills/\` directory.
 
 Markdown links between packaged files are relative links inside this directory. Links to upstream files that this package does not ship, such as the automations and the Claude Code adapter, point at the public \`cursor/plugins\` repository, the same GitHub fallback the Claude Code tree uses.
 
+## Setup
+
+The setup wizard is the packaged \`setup-pstack\` skill. In Pi it writes one user-level file in Pi's agent directory, \`~/.pi/agent/pstack-models.md\` by default, with one line per role: \`provider/model-id:level\`, where the level is one of Pi's thinking levels (\`off\`, \`minimal\`, \`low\`, \`medium\`, \`high\`, \`xhigh\`, \`max\`). \`auto\`, \`inherit-parent\`, and a missing line all mean omit \`model\` and let Pi resolve its default. The wizard keeps its role table, panel lists, budget question, and confirmation step; \`unlimited\`, \`large\`, \`medium\`, and \`small\` set the level instead of rewriting an effort token. A panel list runs one child per entry, and the same model repeated is repeated runs, not a cross-model review. Role lines never go into project instructions, the global default model is never changed, and a configured model that fails is reported instead of being swapped or downgraded. \`docs/harness/pi.md\` carries the exact rules, the role example, and the budget mapping.
+
+MCP is the one host difference with its own flow: \`docs/harness/pi/mcp-setup.md\`. It uses the servers the operator already configured in \`~/.pi/agent/mcp.json\`, in a trusted project's \`.pi/mcp.json\`, or in an installed adapter's config, and it installs and connects nothing. Only an agent that needs a direct MCP tool gets static \`mcp:<server>/<tool>\` entries in \`subagents.agentOverrides.<name>.tools\`, after a preview and a confirmation that merge only those fields, then a reload or restart. pi-subagents 0.81.0 reads an agent's \`tools\` as a strict allowlist, so the flow never writes \`+codemode\`: it stays a literal unknown name and the launch fails. A passing selector or settings check is not proof of connectivity.
+
+## External prerequisites and boundaries
+
+- Model authentication and the model list come from the operator's Pi install. This package ships no provider table, alias map, or model resolver.
+- MCP servers and their credentials are the operator's. This package ships no server definition, installs no adapter, and connects to nothing.
+- The \`bun:test\` suites under \`pstack/skills/poteto-mode/scripts/\` need Bun, which this package neither installs nor assumes. The \`statechart\` tests keep their original skip when TLC is absent and do not download it.
+- Skills with external prerequisites, such as \`make-bot-ui\`, ship as written. Their prerequisites stay the operator's.
+- Skill authoring uses a skill-authoring skill the operator already has. When none is installed, the workflow pauses that step and asks the operator to install one; it does not install anything and does not carry a writing, scoring, or description-optimization toolchain.
+- The package README is the only setup documentation outside the adapter and the MCP flow. There is no second wizard, no separate model-setup or skill-authoring flow document, and no model router.
+
 ## Current boundary
 
-This package ships the skills, the three agents, and the adapter. Role-model setup, MCP setup, the daily candidate sync, and the read-only validation workflow are later tickets and are not in this tree yet. Skills still mention Cursor-only features; those source sentences are preserved and the adapter states what Pi does instead.
+This package ships the skills, the three agents, the adapter, the role-model setup rules, and the MCP flow. The daily candidate sync and the read-only validation workflow are later tickets and are not in this tree yet. Skills still mention Cursor-only features; those source sentences are preserved and the adapter states what Pi does instead.
 
 The agent fields, the discovery paths, and the manifest keys here were checked against Pi 1.4.0 and pi-subagents 0.81.0. No real model, product agent, MCP server, or remote workflow was run to build or check this package. The checks are static and deterministic: they read the generated files, the source documents, and the manifest. A statically discovered agent, a loadable skill, or a passing check is not evidence that a pstack workflow, subagent dispatch, MCP connection, or remote workflow works in Pi.
 `;
@@ -539,6 +918,7 @@ export function renderPackage(root) {
   }
   add("pstack/README.md");
   add(ADAPTER_SOURCE);
+  add(MCP_FLOW_SOURCE);
   files.set("LICENSE", entry(join(root, "pstack", "LICENSE")));
   files.set("licenses/cursor-team-kit-LICENSE", entry(join(root, "cursor-team-kit", "LICENSE")));
 
@@ -560,6 +940,7 @@ export function renderPackage(root) {
   }
 
   const problems = linkProblems(files, root, sources);
+  problems.push(...docExampleProblems(files, root));
   if (problems.length > 0) throw new PiPackageError(problems);
   return { files, sources, pstackSkills, bundled };
 }
