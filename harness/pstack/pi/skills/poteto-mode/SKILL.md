@@ -8,6 +8,8 @@ color: yellow
 
 # Poteto mode
 
+In Pi, read [the Pi adapter](../../docs/harness/pi.md) before you map a Cursor name. The package root is the parent of the `skills/` directory your skills catalog lists; if you cannot find it, tell your parent.
+
 Bundled skills live at `../<name>/SKILL.md` from this file, so put this file's absolute path in every `poteto-agent` prompt.
 
 ## Non-negotiables

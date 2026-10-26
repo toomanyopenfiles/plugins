@@ -6,6 +6,8 @@ disable-model-invocation: true
 
 # Reflect
 
+In Pi, read [the Pi adapter](../../docs/harness/pi.md) before you map a Cursor name. The package root is the parent of the `skills/` directory your skills catalog lists; if you cannot find it, tell your parent.
+
 Mine the current conversation for durable learnings, then route them into skill edits.
 
 Invoke when the user says "reflect" or "/reflect". Skip when the conversation is trivial, off-topic, or already covered by an existing skill the parent followed correctly. One-offs are not learnings.

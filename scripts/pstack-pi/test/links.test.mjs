@@ -22,12 +22,13 @@ test("packaged files link locally and unpackaged upstream files keep a GitHub fa
   assert.match(guide, /\]\(https:\/\/github\.com\/cursor\/plugins\/blob\/main\/pstack\/automations\/benny\/FOR_AGENTS\.md\)/);
   assert.match(guide, /\]\(08-principles\.md\)/);
 
+  // This package ships the three agents, so the guide and README link them locally now.
   const setup = readFileSync(join(packageDir, "docs", "guide", "05-build-and-clean.md"), "utf8");
-  assert.match(setup, /\]\(https:\/\/github\.com\/cursor\/plugins\/blob\/main\/pstack\/agents\/comment-sicko\.md\)/);
+  assert.match(setup, /\]\(\.\.\/\.\.\/agents\/comment-sicko\.md\)/);
 
   const upstream = readFileSync(join(packageDir, "README.upstream.md"), "utf8");
   assert.match(upstream, /\]\(docs\/guide\/README\.md\)/);
-  assert.match(upstream, /\]\(https:\/\/github\.com\/cursor\/plugins\/blob\/main\/pstack\/agents\/poteto-agent\.md\)/);
+  assert.match(upstream, /\]\(\.\/agents\/poteto-agent\.md\)/);
   assert.match(upstream, /\]\(https:\/\/github\.com\/cursor\/plugins\/tree\/main\/pstack\/automations\/benny\/\)/);
 
   // A local link that already works is not rewritten to GitHub.

@@ -6,6 +6,8 @@ disable-model-invocation: true
 
 # Show me your work
 
+In Pi, read [the Pi adapter](../../docs/harness/pi.md) before you map a Cursor name. The package root is the parent of the `skills/` directory your skills catalog lists; if you cannot find it, tell your parent.
+
 Keep one canonical log.
 
 ## The format

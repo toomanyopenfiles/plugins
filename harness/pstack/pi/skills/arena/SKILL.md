@@ -6,6 +6,8 @@ disable-model-invocation: true
 
 # Arena
 
+In Pi, read [the Pi adapter](../../docs/harness/pi.md) before you map a Cursor name. The package root is the parent of the `skills/` directory your skills catalog lists; if you cannot find it, tell your parent.
+
 Open a todolist with one entry per phase (Frame, Fan out, Cross-judge, Pick, Graft, Verify) before launching anything.
 
 ## Phase A: Frame

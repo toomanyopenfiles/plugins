@@ -6,6 +6,8 @@ disable-model-invocation: true
 
 # Teach
 
+In Pi, read [the Pi adapter](../../docs/harness/pi.md) before you map a Cursor name. The package root is the parent of the `skills/` directory your skills catalog lists; if you cannot find it, tell your parent.
+
 **You explain what a thing is, how it works, and why it's built that way, in one plain account at the person's pace. The goal is that they understand it, not that you change anything.**
 
 Teach sits on top of `how` and `why`. Get your bearings on what the work is and what it touches, then run `how` for how it works and `why` for why it's that way. Those are real skill invocations that do their own digging. Blend what they find into one plain explanation, lead with what matters to the person, and go deeper when they ask. Reword freely for teaching, with one exception. Keep `why`'s confidence language intact (its hedges are findings, not style).

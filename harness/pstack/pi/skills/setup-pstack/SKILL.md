@@ -5,6 +5,8 @@ description: Configure which models pstack uses per role and at what reasoning b
 
 # Setup pstack
 
+In Pi, read [the Pi adapter](../../docs/harness/pi.md) before you map a Cursor name. The package root is the parent of the `skills/` directory your skills catalog lists; if you cannot find it, tell your parent.
+
 Write `~/.cursor/rules/pstack-models.mdc`, an always-applied rule that sets pstack's model per role.
 
 ## Steps

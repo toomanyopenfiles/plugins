@@ -1,11 +1,66 @@
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, posix, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const OUTPUT = "harness/pstack/pi";
 export const BUNDLED_SKILLS = ["control-cli", "control-ui", "deslop"];
+export const AGENTS_OUTPUT = "agents";
+/** The public adapter this package ships, as a package-relative path. */
+export const ADAPTER_OUTPUT = "docs/harness/pi.md";
+export const ADAPTER_SOURCE = "pstack/docs/harness/pi.md";
+/** The three agents this package publishes, by file name. `package: pstack` makes them `pstack.<name>`. */
+export const AGENTS = ["comment-sicko", "helper", "poteto-agent"];
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const HELPER_SOURCE = join(HERE, "agents", "helper.md");
+const CURSOR_PLUGIN_LOOKUP =
+  "With no path, before any other work, search `~/.cursor/plugins/` for a file whose path ends in `skills/poteto-mode/SKILL.md`. " +
+  "If more than one file matches, use the copy whose `.cursor-plugin/plugin.json` has the highest `version`. " +
+  "Your skill catalog hides this skill, so a missing catalog entry does not mean pstack is absent.";
+const PI_SKILL_LOOKUP =
+  "With no path, before any other work, take the `poteto-mode` entry from your skills catalog, whose location is that `SKILL.md` path. " +
+  "If the catalog does not list it, search `~/.pi/agent/skills/` and the `skills/` directory of the installed pstack package for a file whose path ends in `skills/poteto-mode/SKILL.md`. " +
+  "A missing catalog entry does not mean pstack is absent.";
+/** The read entry into the adapter, relative to an agent file or to a skill's SKILL.md. */
+const adapterEntry = (path) =>
+  `In Pi, read [the Pi adapter](${path}) before you map a Cursor name. ` +
+  "The package root is the parent of the `skills/` directory your skills catalog lists; if you cannot find it, tell your parent.";
+const COMMENT_SICKO_FIRST_OUTPUT = "Yes... Ha ha ha... Yes!";
 
 const UPSTREAM = "https://github.com/cursor/plugins";
 const LINK = /\]\(([^)\s]+)\)/g;
+
+/**
+ * The Cursor names whose meaning changes on Pi, keyed by the text the Pi adapter must explain.
+ * Same shape as the Claude Code generator's scan: a key earns a row only when a skill uses it.
+ */
+const HOST_TERMS = [
+  { key: "`Task`", re: /`Task`|\bTask (tool|subagent|call)/ },
+  { key: "`AskQuestion`", re: /AskQuestion/ },
+  { key: "todolist", re: /\btodo ?list\b/i },
+  { key: "generalPurpose", re: /generalPurpose/ },
+  { key: "poteto-agent", re: /poteto-agent/ },
+  { key: "comment-sicko", re: /comment-sicko/ },
+  { key: "`readonly: true`", re: /readonly: (true|false)|readonly\/Ask/ },
+  { key: "`environment: \"cloud\"`", re: /environment: "(cloud|local)"/ },
+  { key: "cloud_base_branch", re: /cloud_base_branch/ },
+  { key: "`run_in_background: true`", re: /run_in_background/ },
+  { key: "`resume`", re: /`resume`/ },
+  { key: "`file_attachments`", re: /file_attachments/ },
+  { key: "claude-", re: /\bclaude-[a-z]+-\d/ },
+  { key: "grok-", re: /\bgrok-\d/ },
+  { key: "gpt-", re: /\bgpt-\d/ },
+  { key: "inherit-parent", re: /inherit-parent/ },
+  { key: "pstack-models.mdc", re: /pstack-models\.mdc/ },
+  { key: ".cursor/skills/", re: /\.cursor\/skills/ },
+  { key: "~/.cursor/plugins/", re: /\.cursor\/plugins|\.cursor-plugin/ },
+  { key: ".cursor/rules/", re: /\.cursor\/rules|always-applied rule/ },
+  { key: "agent-transcripts", re: /agent-transcripts|\.cursor\/projects/ },
+  { key: "Cursor-only features", re: /Bugbot|Cursor [Aa]utomation|cursor\.(sh|com)\/automations|[Cc]loud [Aa]gent|built-in PR tool/ },
+  { key: "/loop", re: /\/loop\b|Custom Mode/ },
+];
+/** Skills that tell the reader to run another pstack skill by name, without a link to its file. */
+const ROUTE_KEY = "Run another pstack skill";
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SKIP = new Set([".DS_Store", "node_modules"]);
 const SOURCE_TREES = [
@@ -141,10 +196,14 @@ export function inventory(root) {
   for (const name of pstackSkills) {
     if (BUNDLED_SKILLS.includes(name)) problems.push(`skill name conflict: ${name} exists in pstack/skills and a bundled skill`);
   }
-  for (const path of ["pstack/docs/guide", "pstack/README.md", "pstack/LICENSE", "cursor-team-kit/LICENSE"]) {
+  for (const path of ["pstack/docs/guide", ADAPTER_SOURCE, "pstack/README.md", "pstack/LICENSE", "cursor-team-kit/LICENSE"]) {
     const abs = sourcePath(root, path);
     const wanted = path.endsWith("LICENSE") || path.endsWith(".md") ? isFile(abs) : isDirectory(abs);
     if (!wanted) problems.push(`missing required source ${path}`);
+  }
+  for (const name of AGENTS) {
+    if (name === "helper") continue;
+    if (!isFile(sourcePath(root, `pstack/agents/${name}.md`))) problems.push(`missing required source pstack/agents/${name}.md`);
   }
   for (const name of [...pstackSkills, ...bundled]) {
     const source = pstackSkills.includes(name) ? `pstack/skills/${name}` : `cursor-team-kit/skills/${name}`;
@@ -152,6 +211,149 @@ export function inventory(root) {
   }
   if (problems.length > 0) throw new PiPackageError(problems);
   return { pstackSkills, bundled };
+}
+
+/**
+ * Split an agent file into its flat frontmatter fields and system prompt. Agent files hold one
+ * `key: value` line per field, which is the subset pi-subagents 0.81.0 reads.
+ */
+function agentParts(text, label) {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n/.exec(text);
+  if (!match) throw new PiPackageError([`${label} has no frontmatter`]);
+  const fields = [];
+  for (const line of match[1].split(/\r?\n/)) {
+    const field = /^([A-Za-z][A-Za-z0-9_-]*):[ \t]*(.*)$/.exec(line);
+    if (field) fields.push([field[1], field[2].trim()]);
+  }
+  return { fields, body: text.slice(match[0].length) };
+}
+
+function fieldValue(fields, key) {
+  return fields.find(([name]) => name === key)?.[1];
+}
+
+function renderAgent(fields, body) {
+  return `---\n${fields.map(([key, value]) => `${key}: ${value}`).join("\n")}\n---\n${body}`;
+}
+
+/** Swap one known Cursor-only passage for its Pi equivalent, and fail if the source moved. */
+function replaceOnce(text, from, to, label) {
+  const at = text.indexOf(from);
+  if (at < 0 || text.indexOf(from, at + from.length) >= 0) {
+    throw new PiPackageError([`${label} changed: the Pi conversion no longer finds "${from.slice(0, 48)}"`]);
+  }
+  return text.slice(0, at) + to + text.slice(at + from.length);
+}
+
+function insertAfter(text, marker, addition, label) {
+  const at = text.indexOf(marker);
+  if (at < 0) throw new PiPackageError([`${label} changed: the Pi conversion cannot place the adapter entry after "${marker.trim()}"`]);
+  const end = at + marker.length;
+  return `${text.slice(0, end)}${addition}\n\n${text.slice(end)}`;
+}
+
+// The only frontmatter this conversion adds. A background Cursor delegate is a native async
+// child, and the child keeps the repository instructions and the skills it navigates.
+const CONVERTED_FIELDS = [
+  ["package", "pstack"],
+  ["async", "true"],
+  ["inheritProjectContext", "true"],
+  ["inheritSkills", "true"],
+];
+// Only the agents the original workflow lets delegate get the native nesting grant. The comment
+// reviewer reports and never spawns.
+const NESTING_FIELDS = [["allowNestedSubagents", "true"]];
+const DELEGATING_AGENTS = ["poteto-agent"];
+const CURSOR_ONLY_FIELDS = ["is_background", "run_in_background"];
+
+/** One of the two Cursor agents, converted where Pi differs and left alone everywhere else. */
+function cursorAgent(root, name) {
+  const label = `pstack/agents/${name}.md`;
+  const { fields, body } = agentParts(readFileSync(sourcePath(root, label), "utf8"), label);
+  if (fieldValue(fields, "name") !== name) throw new PiPackageError([`${label} does not declare name ${name}`]);
+  const added = [...CONVERTED_FIELDS, ...(DELEGATING_AGENTS.includes(name) ? NESTING_FIELDS : [])];
+  const kept = fields.filter(([key]) => !CURSOR_ONLY_FIELDS.includes(key) && !added.some(([field]) => field === key));
+  for (const field of added) kept.push(field);
+
+  let prompt = body;
+  if (name === "poteto-agent") {
+    prompt = replaceOnce(prompt, CURSOR_PLUGIN_LOOKUP, PI_SKILL_LOOKUP, label);
+    prompt = insertAfter(prompt, "# Poteto subagent\n\n", adapterEntry("../docs/harness/pi.md"), label);
+  } else {
+    prompt = insertAfter(prompt, `${COMMENT_SICKO_FIRST_OUTPUT}\n\n`, adapterEntry("../docs/harness/pi.md"), label);
+  }
+  return { bytes: Buffer.from(renderAgent(kept, prompt)), executable: false };
+}
+
+/** The helper has no Cursor original: its brief decides the role, so it ships as written. */
+function helperAgent() {
+  const label = toPosix(relative(join(HERE, "..", ".."), HELPER_SOURCE));
+  if (!existsSync(HELPER_SOURCE)) throw new PiPackageError([`missing required source ${label}`]);
+  const text = readFileSync(HELPER_SOURCE, "utf8");
+  const { fields, body } = agentParts(text, label);
+  if (fieldValue(fields, "name") !== "helper" || fieldValue(fields, "package") !== "pstack" || !fieldValue(fields, "description")) {
+    throw new PiPackageError([`${label} must declare name helper, package pstack, and a description`]);
+  }
+  if (body.trim().length === 0) throw new PiPackageError([`${label} has no system prompt`]);
+  return { bytes: Buffer.from(text), executable: false };
+}
+
+function renderAgents(root) {
+  const files = new Map();
+  for (const name of AGENTS) {
+    files.set(`${AGENTS_OUTPUT}/${name}.md`, name === "helper" ? helperAgent() : cursorAgent(root, name));
+  }
+  return files;
+}
+
+/**
+ * Which known host differences each packaged skill names. The scan reads every Markdown file in
+ * the skill directory, so it follows the sources instead of a fixed list of skills.
+ */
+function classifySkills(root, pstackSkills, bundled) {
+  const skills = [...pstackSkills, ...bundled].sort();
+  const dir = (name) =>
+    pstackSkills.includes(name) ? join(root, "pstack", "skills", name) : join(root, "cursor-team-kit", "skills", name);
+  const classes = new Map();
+  for (const name of skills) {
+    const others = skills.filter((other) => other !== name).join("|");
+    const route = new RegExp("the \\*\\*(?<bold>" + others + ")\\*\\* skill|`/(?<command>" + others + ")`", "g");
+    const linksToSkill = (line, other) => line.includes(`(../${other}/`);
+    const namesBareSkill = (line) =>
+      [...line.matchAll(route)].some(({ groups }) => !linksToSkill(line, groups.bold ?? groups.command));
+    const keys = new Set();
+    for (const path of walkFiles(dir(name)).filter((file) => file.endsWith(".md"))) {
+      const text = readFileSync(path, "utf8");
+      for (const term of HOST_TERMS) if (term.re.test(text)) keys.add(term.key);
+      if (text.split("\n").some(namesBareSkill)) keys.add(ROUTE_KEY);
+    }
+    if (keys.size > 0) classes.set(name, [...keys]);
+  }
+  return classes;
+}
+
+/**
+ * Point a skill at the adapter only when it names a host difference, and refuse to ship a
+ * skill whose host difference the adapter does not explain.
+ */
+function adaptSkills(root, files, pstackSkills, bundled) {
+  const adapter = files.get(ADAPTER_OUTPUT)?.bytes.toString("utf8") ?? "";
+  const problems = [];
+  for (const [name, keys] of classifySkills(root, pstackSkills, bundled)) {
+    const outRel = `skills/${name}/SKILL.md`;
+    const current = files.get(outRel);
+    for (const key of keys) {
+      if (!adapter.includes(key)) problems.push(`the Pi adapter does not mention ${key}, used by skills/${name}`);
+    }
+    const text = current.bytes.toString("utf8");
+    if (!/^# /m.test(text)) {
+      problems.push(`${outRel} names ${keys.join(", ")} but has no H1 to place the adapter entry after`);
+      continue;
+    }
+    const note = adapterEntry("../../docs/harness/pi.md");
+    files.set(outRel, { ...current, bytes: Buffer.from(text.replace(/^(# .*)\n+/m, `$1\n\n${note}\n\n`)) });
+  }
+  if (problems.length > 0) throw new PiPackageError(problems);
 }
 
 /** The package path for a source file, when this build ships it. */
@@ -164,6 +366,7 @@ export function mapSourcePath(sourceRel) {
     }
   }
   if (path === "pstack/README.md") return "README.upstream.md";
+  if (path === ADAPTER_SOURCE) return ADAPTER_OUTPUT;
   return null;
 }
 
@@ -259,15 +462,15 @@ export function linkProblems(files, root, sources = new Map()) {
 
 const README = `# pstack for Pi
 
-This directory is generated by \`node scripts/pstack-pi/generate.mjs\`. Do not edit anything under \`harness/pstack/pi/\` by hand. Change the sources under \`pstack/\` or \`cursor-team-kit/skills/\`, regenerate, and commit the result.
+This directory is generated by \`node scripts/pstack-pi/generate.mjs\`. Do not edit anything under \`harness/pstack/pi/\` by hand. Change the sources under \`pstack/\`, \`cursor-team-kit/skills/\`, or \`scripts/pstack-pi/agents/helper.md\`, regenerate, and commit the result.
 
 ## Generate and check
 
 Run these from the repository root:
 
 - \`node scripts/pstack-pi/generate.mjs\` rebuilds \`harness/pstack/pi/\` only. It leaves \`harness/pstack/claude-code/\` and every other output alone.
-- \`node scripts/pstack-pi/check.mjs\` builds the expected file set in memory and compares file names, bytes, and executable bits with the committed tree. It writes nothing.
-- \`node scripts/pstack-pi/test.mjs\` runs the existing pstack deterministic tests, the Pi package regressions, and the read-only generated-package check.
+- \`node scripts/pstack-pi/check.mjs\` builds the expected file set in memory and compares file names, bytes, and executable bits with the committed tree. It then checks the manifest, the skill frontmatter, and the agent names pi-subagents would discover. It writes nothing.
+- \`node scripts/pstack-pi/test.mjs\` runs the existing Node tests under \`pstack/skills/*/scripts/test/\`, the Pi regressions in \`scripts/pstack-pi/test/\`, and the read-only check above. It does not run the \`bun:test\` suites under \`pstack/skills/poteto-mode/scripts/\`: those need Bun, which this package neither installs nor assumes.
 
 The output records no timestamp and no artifact hash, so repeated generation from the same sources is identical. The skill list and count come from the source directories; there is no fixed baseline. The inherited Claude Code generator (\`node scripts/generate-pstack-harness-trees.mjs\`) owns the whole \`harness/pstack\` tree. Do not run it while this package exists: it deletes and rebuilds the parent tree. The Pi entries never call it. The inherited \`validate-plugins.yml\` workflow still runs that generator's check across \`harness/pstack/\`, so it will report this Pi tree as drift until the fork disables or replaces that inherited check; changing the inherited workflow is a separate authorized step.
 
@@ -275,16 +478,18 @@ The output records no timestamp and no artifact hash, so repeated generation fro
 
 - Every skill in \`pstack/skills/\`, including \`make-bot-ui\` and the other skills with external prerequisites.
 - The complete \`deslop\`, \`control-cli\`, and \`control-ui\` skill directories from \`cursor-team-kit/skills/\`, not just their entry documents.
+- Three agents in \`agents/\`, discovered through the manifest's \`pi-subagents.agents\`: \`pstack.poteto-agent\` and \`pstack.comment-sicko\`, converted from the Cursor agents only where Pi differs, and \`pstack.helper\`, a neutral delegate whose role comes from the brief it is given. The two converted agents keep their original responsibility, body, and output contract: the background field becomes \`async\`, the Cursor plugin lookup becomes a Pi skill lookup, and each points at the adapter. \`pstack.helper\` appends to Pi's normal prompt and inherits project instructions, the operator's global instructions, and the skills catalog. \`pstack.poteto-agent\` and \`pstack.helper\` carry the native \`allowNestedSubagents\` grant; none of the three sets a model, a thinking level, or a tool or extension allowlist.
+- The Pi adapter at \`docs/harness/pi.md\`, generated from \`pstack/docs/harness/pi.md\`. A packaged skill gains one entry paragraph that points at it only when the skill directory names a known host difference such as \`Task\`, \`generalPurpose\`, \`run_in_background\`, or a Cursor path. The source skills are never edited, and the adapter is read locally instead of fetched.
 - The pstack guide in \`docs/guide/\`, the upstream pstack README as \`README.upstream.md\`, and both MIT licenses: \`LICENSE\` for pstack and \`licenses/cursor-team-kit-LICENSE\` for the bundled Cursor Team Kit skills. The copyright lines are kept verbatim.
-- \`package.json\` declares \`pi.skills\` as \`./skills\`, Pi's native skill resource discovery. The same skills also live in the conventional \`skills/\` directory.
+- \`package.json\` declares \`pi.skills\` as \`./skills\` and \`pi-subagents.agents\` as \`./agents\`, the native Pi and pi-subagents discovery fields. The same skills also live in the conventional \`skills/\` directory.
 
-Markdown links between packaged files are relative links inside this directory. Links to upstream files that this package does not ship, such as agents, automations, and the Claude Code adapter, point at the public \`cursor/plugins\` repository, the same GitHub fallback the Claude Code tree uses.
+Markdown links between packaged files are relative links inside this directory. Links to upstream files that this package does not ship, such as the automations and the Claude Code adapter, point at the public \`cursor/plugins\` repository, the same GitHub fallback the Claude Code tree uses.
 
 ## Current boundary
 
-This package ships skill resources only. The Pi adapter, the three \`pstack.*\` subagents, role-model setup, MCP setup, and the sync and validation workflows are later tickets and are not in this tree yet. Skills still mention Cursor-only features; those source sentences are preserved. A skill being discoverable or loadable is not evidence that a pstack workflow, subagent dispatch, MCP connection, or remote workflow works in Pi.
+This package ships the skills, the three agents, and the adapter. Role-model setup, MCP setup, the daily candidate sync, and the read-only validation workflow are later tickets and are not in this tree yet. Skills still mention Cursor-only features; those source sentences are preserved and the adapter states what Pi does instead.
 
-No real model, product agent, MCP server, or remote workflow was run to build or check this package. The checks are static and deterministic.
+The agent fields, the discovery paths, and the manifest keys here were checked against Pi 1.4.0 and pi-subagents 0.81.0. No real model, product agent, MCP server, or remote workflow was run to build or check this package. The checks are static and deterministic: they read the generated files, the source documents, and the manifest. A statically discovered agent, a loadable skill, or a passing check is not evidence that a pstack workflow, subagent dispatch, MCP connection, or remote workflow works in Pi.
 `;
 
 function packageJson() {
@@ -296,6 +501,7 @@ function packageJson() {
       license: "MIT",
       keywords: ["pi-package"],
       pi: { skills: ["./skills"] },
+      "pi-subagents": { agents: ["./agents"] },
     },
     null,
     2,
@@ -332,6 +538,7 @@ export function renderPackage(root) {
     add(toPosix(relative(root, path)));
   }
   add("pstack/README.md");
+  add(ADAPTER_SOURCE);
   files.set("LICENSE", entry(join(root, "pstack", "LICENSE")));
   files.set("licenses/cursor-team-kit-LICENSE", entry(join(root, "cursor-team-kit", "LICENSE")));
 
@@ -340,6 +547,9 @@ export function renderPackage(root) {
 
   files.set("package.json", { bytes: Buffer.from(packageJson()), executable: false });
   files.set("README.md", { bytes: Buffer.from(README), executable: false });
+  for (const [outRel, file] of renderAgents(root)) files.set(outRel, file);
+
+  adaptSkills(root, files, pstackSkills, bundled);
 
   for (const [outRel, sourceRel] of sources) {
     if (!outRel.endsWith(".md")) continue;
@@ -377,6 +587,11 @@ function manifestProblems(manifest, packageDir) {
   if (!Array.isArray(skills) || !skills.includes("./skills")) {
     problems.push(`${OUTPUT}/package.json does not declare pi.skills as ./skills`);
   }
+  // pi-subagents 0.81.0 reads either "pi-subagents".agents or "pi.subagents".agents from an installed package.
+  const agents = manifest["pi-subagents"]?.agents;
+  if (!Array.isArray(agents) || !agents.includes("./agents")) {
+    problems.push(`${OUTPUT}/package.json does not declare pi-subagents.agents as ./agents`);
+  }
   for (const path of manifestPaths(manifest)) {
     if (/^([/\\]|[A-Za-z]:)/.test(path) || path.split(/[/\\]/).includes("..")) {
       problems.push(`${OUTPUT}/package.json declares an absolute or escaping path: ${path}`);
@@ -404,6 +619,51 @@ function driftProblems(expected, actual) {
     else if (want.executable !== have.executable) problems.push(`${OUTPUT}/${path} has a different executable bit`);
   }
   return problems;
+}
+
+/**
+ * The agents pi-subagents would discover from this manifest, named the way it names them.
+ * Reading the packaged files catches a source edit that would rename an agent without changing
+ * the file set.
+ */
+function discoveredAgents(packageDir) {
+  const problems = [];
+  const manifestPath = join(packageDir, "package.json");
+  let manifest = {};
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch {
+    return { problems, names: [] };
+  }
+  const roots = [manifest["pi-subagents"]?.agents, manifest.pi?.subagents?.agents]
+    .filter(Array.isArray)
+    .flat()
+    .filter((path) => typeof path === "string" && !/^([/\\]|[A-Za-z]:)/.test(path) && !path.split(/[/\\]/).includes(".."));
+  const names = new Map();
+  for (const root of roots) {
+    const dir = join(packageDir, ...root.split("/"));
+    for (const path of walkFiles(dir).filter((file) => file.endsWith(".md"))) {
+      const rel = `${OUTPUT}/${toPosix(relative(packageDir, path))}`;
+      let parts;
+      try {
+        parts = agentParts(readFileSync(path, "utf8"), rel);
+      } catch {
+        problems.push(`${rel} has no frontmatter`);
+        continue;
+      }
+      const name = fieldValue(parts.fields, "name");
+      const pkg = fieldValue(parts.fields, "package");
+      if (!name || !fieldValue(parts.fields, "description")) {
+        problems.push(`${rel} is skipped by pi-subagents because it has no name or description`);
+        continue;
+      }
+      if (parts.body.trim() === "") problems.push(`${rel} has no system prompt`);
+      const runtime = pkg ? `${pkg}.${name}` : name;
+      if (names.has(runtime)) problems.push(`${rel} and ${names.get(runtime)} both register the agent ${runtime}`);
+      else names.set(runtime, rel);
+    }
+  }
+  return { problems, names: [...names.keys()].sort() };
 }
 
 function sourceCoverageProblems(root, source, actual) {
@@ -448,6 +708,7 @@ export function inspectPackage(root) {
       skills: expected.pstackSkills.length + expected.bundled.length,
       pstackSkills: expected.pstackSkills.length,
       bundled: expected.bundled.length,
+      agents: 0,
       files: 0,
     };
   }
@@ -484,6 +745,16 @@ export function inspectPackage(root) {
   }
   if (generated.length !== wanted.length) problems.push(`${OUTPUT} has ${generated.length} skills; the sources have ${wanted.length}`);
 
+  const agents = discoveredAgents(packageDir);
+  problems.push(...agents.problems);
+  const wantedAgents = AGENTS.map((name) => `pstack.${name}`).sort();
+  for (const name of wantedAgents) {
+    if (!agents.names.includes(name)) problems.push(`${OUTPUT} does not discover the agent ${name}`);
+  }
+  for (const name of agents.names) {
+    if (!wantedAgents.includes(name)) problems.push(`${OUTPUT} discovers an agent that is not one of the three: ${name}`);
+  }
+
   for (const [output, sourceRel] of [
     ["LICENSE", "pstack/LICENSE"],
     ["licenses/cursor-team-kit-LICENSE", "cursor-team-kit/LICENSE"],
@@ -501,6 +772,7 @@ export function inspectPackage(root) {
     skills: generated.length,
     pstackSkills: expected.pstackSkills.length,
     bundled: expected.bundled.length,
+    agents: agents.names.length,
     files: actual.size,
   };
 }

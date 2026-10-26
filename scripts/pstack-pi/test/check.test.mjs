@@ -116,6 +116,25 @@ test("a packaged file linked through GitHub is reported instead of accepted", (t
   assert.match(result.stderr, /links to GitHub for packaged docs\/guide\/01-setup\.md/);
 });
 
+test("an agent that would be discovered under another name fails the check", (t) => {
+  const root = generated(t);
+  const path = join(root, output, "agents", "helper.md");
+  writeFileSync(path, readFileSync(path, "utf8").replace(/^package: pstack$/m, "package: other"));
+  const result = check(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /does not discover the agent pstack\.helper/);
+  assert.match(result.stderr, /discovers an agent that is not one of the three: other\.helper/);
+});
+
+test("an agent that pi-subagents would skip is reported", (t) => {
+  const root = generated(t);
+  const path = join(root, output, "agents", "comment-sicko.md");
+  writeFileSync(path, readFileSync(path, "utf8").replace(/^description: .*$/m, "description:"));
+  const result = check(root);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /agents\/comment-sicko\.md is skipped by pi-subagents because it has no name or description/);
+});
+
 test("a tampered license fails", (t) => {
   const root = generated(t);
   appendFileSync(join(root, output, "licenses", "cursor-team-kit-LICENSE"), "\nlocal addition\n");
