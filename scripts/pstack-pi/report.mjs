@@ -3,13 +3,21 @@
 import { pathToFileURL } from "node:url";
 
 export const MARKER = "<!-- pstack-pi-candidate-report -->";
+export const WORKFLOW_PATH = ".github/workflows/pstack-pi-validate.yml";
 
+const CANDIDATE_BRANCH = "pi-candidate";
+const BASE_BRANCH = "main";
 const STATE = /<!-- pstack-pi-candidate-report-state head=([0-9a-f]{40}) run=(\d+) attempt=(\d+) -->/;
 const RESULTS = new Map([
   ["success", "passed"],
   ["failure", "failed"],
+  ["timed_out", "failed"],
+  ["startup_failure", "failed"],
+  ["action_required", "failed"],
   ["cancelled", "cancelled"],
   ["skipped", "skipped"],
+  ["neutral", "skipped"],
+  ["stale", "skipped"],
 ]);
 const SHA = /^[0-9a-f]{40}$/;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -19,9 +27,10 @@ export function renderReport({ head, outcome, runId, runAttempt, runUrl }) {
   const result = RESULTS.get(outcome);
   if (!result) throw new Error(`unknown validation result: ${outcome}`);
   if (!SHA.test(head)) throw new Error(`invalid head SHA: ${head}`);
-  if (!RUN_URL.test(runUrl)) throw new Error("invalid Actions run URL");
   if (!Number.isSafeInteger(runId) || runId < 1) throw new Error("run id must be a positive integer");
   if (!Number.isSafeInteger(runAttempt) || runAttempt < 1) throw new Error("run attempt must be a positive integer");
+  if (actionsRunIdFromUrl(runUrl) !== runId) throw new Error("Actions run URL must link the validation run id");
+
   const body = [
     MARKER,
     `<!-- pstack-pi-candidate-report-state head=${head} run=${runId} attempt=${runAttempt} -->`,
@@ -32,17 +41,19 @@ export function renderReport({ head, outcome, runId, runAttempt, runUrl }) {
     `- Result: **${result}** (validate job: \`${outcome}\`)`,
     `- Actions log: [run ${runId}, attempt ${runAttempt}](${runUrl})`,
     "",
-    "Validation checks the committed candidate content with a read-only token. It runs the Pi package check and deterministic tests, and does not generate or push back, run real models or product agents, or upload candidate artifacts. This comment is maintained by the report job with the pstack GitHub App; the candidate code is never executed with a write token.",
+    "Validation checks the committed candidate content with a read-only token. It runs the Pi package check and deterministic tests, and does not generate or push back, run real models or product agents, or upload candidate artifacts. This comment is written from the trusted `workflow_run` entry after verifying that the pull request is still the open `pi-candidate` candidate at the checked head. Candidate code is never executed with the App write token.",
     "",
   ].join("\n");
   return body;
 }
 
-export async function publishReport({ client, expectedHead, outcome, runId, runAttempt, runUrl }) {
+export async function publishReport({ repo, client, expectedHead, outcome, runId, runAttempt, runUrl, source }) {
+  if (!isTrustedSource({ source, repo })) return { status: "skipped", reason: "untrusted-source" };
   const body = renderReport({ head: expectedHead, outcome, runId, runAttempt, runUrl });
+
   const pull = await client.getPull();
-  if (pull.state !== "open") return { status: "skipped", reason: "pull-not-open" };
-  if (pull.head.sha !== expectedHead) return { status: "skipped", reason: "stale-head", head: pull.head.sha };
+  const initialProblem = pullProblem(pull, expectedHead, source);
+  if (initialProblem) return skippedPull(initialProblem, pull);
 
   const comments = await client.listComments();
   const existing = comments.find((comment) => comment.user?.type === "Bot" && comment.body?.includes(MARKER));
@@ -50,9 +61,9 @@ export async function publishReport({ client, expectedHead, outcome, runId, runA
 
   // Re-read the head immediately before the only write, so a run that raced a push cannot overwrite it.
   const current = await client.getPull();
-  if (current.state !== "open") return { status: "skipped", reason: "pull-not-open" };
-  if (current.head.sha !== expectedHead) return { status: "skipped", reason: "stale-head", head: current.head.sha };
-  if (previous && isOlder(previous, { runId, runAttempt }) && previous.head === expectedHead) {
+  const currentProblem = pullProblem(current, expectedHead, source);
+  if (currentProblem) return skippedPull(currentProblem, current);
+  if (previous && previousIsNewer(previous, { runId, runAttempt }) && previous.head === expectedHead) {
     return { status: "skipped", reason: "stale-run" };
   }
 
@@ -64,21 +75,64 @@ export async function publishReport({ client, expectedHead, outcome, runId, runA
   return { status: "published", action: "created", commentId: created.id };
 }
 
+function isTrustedSource({ source, repo }) {
+  return (
+    source.event === "pull_request" &&
+    source.branch === CANDIDATE_BRANCH &&
+    source.base === BASE_BRANCH &&
+    source.repo === repo &&
+    source.workflow === WORKFLOW_PATH
+  );
+}
+
+function pullProblem(pull, expectedHead, source) {
+  if (pull?.state !== "open") return "pull-not-open";
+  if (
+    pull?.head?.repo?.full_name !== source.repo ||
+    pull?.head?.ref !== source.branch ||
+    pull?.base?.ref !== source.base
+  ) {
+    return "not-candidate-pr";
+  }
+  if (pull?.head?.sha !== expectedHead) return "stale-head";
+  return null;
+}
+
+function skippedPull(reason, pull) {
+  if (reason === "stale-head") return { status: "skipped", reason, head: pull.head.sha };
+  return { status: "skipped", reason };
+}
+
 function previousState(body) {
   const match = STATE.exec(body ?? "");
   if (!match) return null;
   return { head: match[1], runId: Number(match[2]), runAttempt: Number(match[3]) };
 }
 
-function isOlder(previous, current) {
+function previousIsNewer(previous, current) {
   if (previous.runId !== current.runId) return previous.runId > current.runId;
   return previous.runAttempt > current.runAttempt;
 }
 
-export function createGitHubClient({ apiUrl = "https://api.github.com", repo, pr, token, fetchImpl = globalThis.fetch }) {
+function assertRepo(repo) {
   if (!REPOSITORY.test(repo ?? "") || repo.split("/").some((part) => part === "." || part === "..")) {
     throw new Error("repository must be owner/name");
   }
+  return repo;
+}
+
+function actionsRunIdFromUrl(runUrl) {
+  if (!RUN_URL.test(runUrl)) return null;
+  try {
+    const match = /\/actions\/runs\/(\d+)$/.exec(new URL(runUrl).pathname);
+    return match ? Number(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function createGitHubClient({ apiUrl = "https://api.github.com", repo, pr, token, fetchImpl = globalThis.fetch }) {
+  assertRepo(repo);
   if (!Number.isSafeInteger(pr) || pr < 1) throw new Error("pull request number must be a positive integer");
   if (!token) throw new Error("a report token is required");
   const base = apiUrl.replace(/\/+$/, "");
@@ -121,7 +175,21 @@ function positiveInteger(value, label) {
 }
 
 function parseArgs(argv) {
-  const allowed = new Set(["repo", "pr", "head", "outcome", "run-id", "run-attempt", "run-url", "api-url"]);
+  const allowed = new Set([
+    "repo",
+    "pr",
+    "head",
+    "outcome",
+    "run-id",
+    "run-attempt",
+    "run-url",
+    "source-event",
+    "source-branch",
+    "source-base",
+    "source-repo",
+    "source-workflow",
+    "api-url",
+  ]);
   const values = new Map();
   for (let index = 0; index < argv.length; index += 2) {
     const flag = argv[index];
@@ -138,16 +206,25 @@ function parseArgs(argv) {
     return value;
   };
 
-  const repo = required("repo");
-  if (!REPOSITORY.test(repo) || repo.split("/").some((part) => part === "." || part === "..")) {
-    throw new Error("--repo must be owner/name");
-  }
+  const repo = assertRepo(required("repo"));
   const head = required("head").toLowerCase();
   if (!SHA.test(head)) throw new Error("--head must be a 40-character Git commit SHA");
   const outcome = required("outcome");
   if (!RESULTS.has(outcome)) throw new Error(`unknown validation result: ${outcome}`);
+  const runId = positiveInteger(required("run-id"), "--run-id");
+  const runAttempt = positiveInteger(required("run-attempt"), "--run-attempt");
   const runUrl = required("run-url");
   if (!RUN_URL.test(runUrl)) throw new Error("--run-url must be an https Actions run URL");
+  if (actionsRunIdFromUrl(runUrl) !== runId) throw new Error("--run-url must link the validation run id");
+
+  const source = {
+    event: required("source-event"),
+    branch: required("source-branch"),
+    base: required("source-base"),
+    repo: required("source-repo"),
+    workflow: required("source-workflow"),
+  };
+
   const apiUrl = values.get("api-url") ?? "https://api.github.com";
   const parsedApiUrl = new URL(apiUrl);
   if (!["http:", "https:"].includes(parsedApiUrl.protocol) || parsedApiUrl.username || parsedApiUrl.password) {
@@ -161,9 +238,10 @@ function parseArgs(argv) {
     pr: positiveInteger(required("pr"), "--pr"),
     head,
     outcome,
-    runId: positiveInteger(required("run-id"), "--run-id"),
-    runAttempt: positiveInteger(required("run-attempt"), "--run-attempt"),
+    runId,
+    runAttempt,
     runUrl,
+    source,
     apiUrl,
     token,
   };
@@ -173,12 +251,14 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const client = createGitHubClient({ apiUrl: options.apiUrl, repo: options.repo, pr: options.pr, token: options.token });
   const result = await publishReport({
+    repo: options.repo,
     client,
     expectedHead: options.head,
     outcome: options.outcome,
     runId: options.runId,
     runAttempt: options.runAttempt,
     runUrl: options.runUrl,
+    source: options.source,
   });
   if (result.status === "published") {
     console.log(`ok: ${result.action} pstack Pi candidate report for ${options.head} (comment ${result.commentId})`);

@@ -9,13 +9,21 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+  workflow_run:
+    workflows:
+      - Validate pstack Pi candidate
+    types:
+      - completed
 
 permissions: {}
 
 jobs:
   validate:
     name: pstack Pi candidate validation
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'pi-candidate'
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'pi-candidate'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -39,10 +47,17 @@ jobs:
 
   report:
     name: pstack Pi candidate report
-    needs: validate
-    if: always() && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'pi-candidate'
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_branch == 'pi-candidate' &&
+      github.event.workflow_run.path == '.github/workflows/pstack-pi-validate.yml' &&
+      github.event.workflow_run.repository.full_name == github.repository &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].base.ref == 'main'
+    environment: pstack-pi-write
     concurrency:
-      group: pstack-pi-report-${{ github.event.pull_request.number }}
+      group: pstack-pi-report-${{ github.event.workflow_run.pull_requests[0].number }}
       cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
@@ -59,21 +74,31 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
-      - name: Check out the trusted base revision only
+      - name: Check out the trusted main revision only
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: main
           persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
       - name: Update the single report comment after the head check
         env:
           GH_TOKEN: ${{ steps.report-token.outputs.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          VALIDATION_RESULT: ${{ needs.validate.result }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          EXPECTED_HEAD: ${{ github.event.workflow_run.pull_requests[0].head.sha }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_BASE: ${{ github.event.workflow_run.pull_requests[0].base.ref }}
+          SOURCE_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_WORKFLOW: ${{ github.event.workflow_run.path }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}
+          VALIDATION_RESULT: ${{ github.event.workflow_run.conclusion }}
         run: >-
           node scripts/pstack-pi/report.mjs
           --repo "$GITHUB_REPOSITORY"
@@ -83,3 +108,8 @@ jobs:
           --run-id "$RUN_ID"
           --run-attempt "$RUN_ATTEMPT"
           --run-url "$RUN_URL"
+          --source-event "$SOURCE_EVENT"
+          --source-branch "$SOURCE_BRANCH"
+          --source-base "$SOURCE_BASE"
+          --source-repo "$SOURCE_REPO"
+          --source-workflow "$SOURCE_WORKFLOW"

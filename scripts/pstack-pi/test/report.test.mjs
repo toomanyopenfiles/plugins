@@ -10,14 +10,18 @@ const repo = "toomanyopenfiles/plugins";
 const token = "test-token";
 const head = "a".repeat(40);
 const newerHead = "b".repeat(40);
+const workflowPath = ".github/workflows/pstack-pi-validate.yml";
 
 /**
  * A synthetic GitHub API for the report path. It records every request so a test can
- * assert that a stale run wrote nothing, and it never reaches a real remote.
+ * assert that a stale or untrusted run wrote nothing, and it never reaches a real remote.
  */
 async function startApi(t, options = {}) {
   const state = {
     head: options.head ?? head,
+    headRef: options.headRef ?? "pi-candidate",
+    baseRef: options.baseRef ?? "main",
+    headRepo: options.headRepo ?? repo,
     pullState: options.pullState ?? "open",
     comments: options.comments ?? [],
     headChanges: options.headChanges ?? {},
@@ -43,7 +47,12 @@ async function startApi(t, options = {}) {
     if (req.method === "GET" && url.pathname === `/repos/${repo}/pulls/7`) {
       state.pullReads += 1;
       if (state.headChanges[state.pullReads]) state.head = state.headChanges[state.pullReads];
-      return send(200, { number: 7, state: state.pullState, head: { sha: state.head } });
+      return send(200, {
+        number: 7,
+        state: state.pullState,
+        head: { sha: state.head, ref: state.headRef, repo: { full_name: state.headRepo } },
+        base: { ref: state.baseRef },
+      });
     }
 
     if (req.method === "GET" && url.pathname === `/repos/${repo}/issues/7/comments`) {
@@ -81,14 +90,20 @@ async function startApi(t, options = {}) {
 }
 
 function reportArgs(api, overrides = {}) {
+  const runId = overrides["run-id"] ?? "100";
   const values = {
     repo,
     pr: "7",
     head,
     outcome: "success",
-    "run-id": "100",
+    "run-id": runId,
     "run-attempt": "1",
-    "run-url": `https://github.com/${repo}/actions/runs/100`,
+    "run-url": `https://github.com/${repo}/actions/runs/${runId}`,
+    "source-event": "pull_request",
+    "source-branch": "pi-candidate",
+    "source-base": "main",
+    "source-repo": repo,
+    "source-workflow": workflowPath,
     "api-url": api.url,
     ...overrides,
   };
@@ -128,6 +143,8 @@ test("a passing validation creates one report comment with the head and Actions 
   const body = api.state.comments[0].body;
   assert.match(body, /<!-- pstack-pi-candidate-report -->/);
   assert.match(body, /Result: \*\*passed\*\*/);
+  assert.match(body, /trusted `workflow_run` entry/);
+  assert.match(body, /never executed with the App write token/);
   assert.ok(body.includes(head), "the report does not name the checked head");
   assert.ok(body.includes(`https://github.com/${repo}/actions/runs/100`), "the report does not link the Actions log");
   assert.deepEqual(
@@ -158,6 +175,48 @@ test("a failing validation updates the existing report comment instead of adding
     writes(api.state).map((request) => `${request.method} ${request.path}`),
     [`PATCH /repos/${repo}/issues/comments/42`],
   );
+});
+
+test("a timed-out validation is reported as failed and a skipped run as skipped", async (t) => {
+  const api = await startApi(t);
+  const timedOut = await runReport(api, { outcome: "timed_out" });
+  assert.equal(timedOut.status, 0, timedOut.stderr);
+  assert.match(api.state.comments[0].body, /Result: \*\*failed\*\*/);
+
+  const skipped = await runReport(api, { outcome: "skipped", "run-id": "101" });
+  assert.equal(skipped.status, 0, skipped.stderr);
+  assert.match(api.state.comments[0].body, /Result: \*\*skipped\*\*/);
+});
+
+test("a source that is not the trusted candidate event is ignored before the API call", async (t) => {
+  const api = await startApi(t);
+
+  for (const overrides of [
+    { "source-event": "push" },
+    { "source-branch": "other" },
+    { "source-base": "release" },
+    { "source-repo": "someone/fork" },
+    { "source-workflow": ".github/workflows/other.yml" },
+  ]) {
+    const result = await runReport(api, overrides);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /skip: untrusted-source/);
+  }
+
+  assert.equal(api.state.comments.length, 0);
+  assert.deepEqual(api.state.requests, []);
+});
+
+test("a pull request that is not the open pi-candidate branch into main is ignored", async (t) => {
+  for (const options of [{ headRef: "other" }, { baseRef: "release" }, { headRepo: "someone/fork" }]) {
+    const api = await startApi(t, options);
+    const result = await runReport(api);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /skip: not-candidate-pr/);
+    assert.equal(api.state.comments.length, 0);
+    assert.deepEqual(writes(api.state), []);
+  }
 });
 
 test("a run whose head is no longer current writes nothing", async (t) => {
@@ -238,8 +297,21 @@ test("candidate-controlled report values are rejected as data, not run as a comm
   assert.equal(sha.status, 1);
   assert.match(sha.stderr, /--head/);
 
+  const source = await runReport(api, { "source-workflow": `other.yml; touch ${canary}` });
+  assert.equal(source.status, 0, source.stderr);
+  assert.match(source.stdout, /skip: untrusted-source/);
+
   assert.equal(api.state.comments.length, 0);
   assert.ok(!existsSync(canary), "input text executed as a shell command");
+});
+
+test("a report for one run cannot link another run's log", async (t) => {
+  const api = await startApi(t);
+  const result = await runReport(api, { "run-url": `https://github.com/${repo}/actions/runs/101` });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--run-url/);
+  assert.equal(api.state.comments.length, 0);
 });
 
 test("the report entry does not print the App token when the API rejects it", async (t) => {
