@@ -21,7 +21,13 @@ const SOURCES = [
   "cursor-team-kit/skills/deslop",
 ];
 const MINIMAL_SOURCES = ["pstack/skills/tdd"];
-const SCRIPTS = ["lib.mjs", "generate.mjs", "check.mjs", "sync.mjs"];
+// Every trusted entry and source document the generator reads from `scripts/pstack-pi`, minus the
+// tests. Copying the whole directory keeps the fixture on the real current sources: a later source
+// document such as `agents/helper.md` must not need a fixture edit to reach the seed tree.
+const SCRIPT_ENTRIES = readdirSync(join(repoRoot, "scripts", "pstack-pi"), { withFileTypes: true })
+  .filter((entry) => entry.name !== "test" && entry.name !== "test.mjs")
+  .map((entry) => entry.name)
+  .sort();
 const OUTPUT = "harness/pstack/pi";
 
 // The inherited whole-tree generator must never run from the Pi sync path. If it does,
@@ -134,8 +140,8 @@ export function makeSyncFixture(t, options = {}) {
     cpSync(join(repoRoot, path), join(seed, path), { recursive: true });
   }
   mkdirSync(join(seed, "scripts", "pstack-pi"), { recursive: true });
-  for (const name of SCRIPTS) {
-    cpSync(join(repoRoot, "scripts", "pstack-pi", name), join(seed, "scripts", "pstack-pi", name));
+  for (const name of SCRIPT_ENTRIES) {
+    cpSync(join(repoRoot, "scripts", "pstack-pi", name), join(seed, "scripts", "pstack-pi", name), { recursive: true });
   }
   writeFileSync(join(seed, "scripts", "generate-pstack-harness-trees.mjs"), CANARY);
   writeFileSync(join(seed, "README.md"), "# fixture fork\n");
